@@ -271,7 +271,7 @@ class AttitudeMPC(Controller):
         yref_e[5] = self._waypoints_yaw[i + self._N]  # yaw
         yref_e[6:9] = self._waypoints_vel[i + self._N]  # velocity
         # zero drpy
-        self._acados_ocp_solver.set(self._N, "y_ref", yref_e)
+        self._acados_ocp_solver.set(self._N, "yref_e", yref_e)
 
         # Solving problem and getting first input
         self._acados_ocp_solver.solve()

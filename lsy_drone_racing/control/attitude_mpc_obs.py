@@ -23,11 +23,58 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.obstacleManager import ObstacleManager
-from lsy_drone_racing.control.trajectory_planner import TrajectoryPlanner
+from lsy_drone_racing.control.planners import TOGTPlanner
 
 if TYPE_CHECKING:
     from crazyflow import Sim
     from numpy.typing import NDArray
+
+
+def _extract_track_list(track_config: object | None, field: str) -> list:
+    if track_config is None:
+        return []
+    if hasattr(track_config, field):
+        return getattr(track_config, field)
+    if isinstance(track_config, dict):
+        return track_config.get(field, [])
+    try:
+        return track_config[field]
+    except Exception:
+        return []
+
+
+def _build_togt_gates(track_config: object | None) -> list[dict[str, np.ndarray]]:
+    gates = _extract_track_list(track_config, "gates")
+    gate_polygons = []
+
+    for gate in gates:
+        gate_pos = np.asarray(gate["pos"], dtype=np.float64)
+        gate_rpy = np.asarray(gate["rpy"], dtype=np.float64)
+        yaw = float(gate_rpy[2])
+        inner_width = float(
+            gate.get("inner_width", 0.4)
+            if isinstance(gate, dict)
+            else getattr(gate, "inner_width", 0.4)
+        )
+
+        half_width = inner_width / 2.0
+        local_corners = [
+            np.array([0.0, -half_width, half_width], dtype=np.float64),
+            np.array([0.0, half_width, half_width], dtype=np.float64),
+            np.array([0.0, half_width, -half_width], dtype=np.float64),
+            np.array([0.0, -half_width, -half_width], dtype=np.float64),
+        ]
+
+        R_mat = np.array(
+            [[np.cos(yaw), -np.sin(yaw), 0.0], [np.sin(yaw), np.cos(yaw), 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        world_corners = [(R_mat @ corner) + gate_pos for corner in local_corners]
+        V = np.column_stack([corner - gate_pos for corner in world_corners])
+
+        gate_polygons.append({"type": "polygon", "origin": gate_pos, "V": V})
+
+    return gate_polygons
 
 
 def create_acados_model(parameters: dict, obs_manager: ObstacleManager) -> AcadosModel:
@@ -225,33 +272,26 @@ class AttitudeMPC(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
-        self._N = 30
+        self._N = 15
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
-        self.obs_manager = ObstacleManager(safety_margin=0.12)
-        self.obs_manager.initialize_nominal_track()
+        self.obs_manager = ObstacleManager(safety_margin=0.08)
+        self.drone_params = load_params("so_rpy", config.sim.drone_model)
+        self.obs_manager.initialize_track(config.env.track)
         self._observed_gate_positions: np.ndarray | None = None
         self._observed_obstacle_positions: np.ndarray | None = None
 
-        # Use the shared trajectory planner so all trajectory tasks remain consistent.
-        waypoints = np.array(
-            [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
+        gate_polygons = _build_togt_gates(config.env.track)
+        start_pos = np.asarray(obs["pos"], dtype=np.float64)
+        self._trajectory_planner = TOGTPlanner(
+            gate_polygons,
+            parameters=self.drone_params,
+            freq=config.env.freq,
+            start_pos=start_pos,
         )
-        self._trajectory_planner = TrajectoryPlanner(waypoints, t_total=7.2, freq=config.env.freq)
+        self._trajectory_planner.plan_trajectory()
 
-        self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, self.obs_manager
         )
@@ -261,7 +301,7 @@ class AttitudeMPC(Controller):
         self._ny_e = self._nx
 
         self._tick = 0
-        self._tick_max = self._trajectory_planner.max_ticks - self._N
+        self._tick_max = max(0, self._trajectory_planner.max_ticks - self._N)
         self._config = config
         self._finished = False
 
@@ -355,7 +395,8 @@ class AttitudeMPC(Controller):
         yref_e[5] = yaw_e
         yref_e[6:9] = vel_e
         # zero drpy
-        self._acados_ocp_solver.set(self._N, "y_ref", yref_e)
+        # AcadosOcpSolver expects stage variable names, not the OCP cost attribute name.
+        self._acados_ocp_solver.set(self._N, "yref", yref_e)
 
         current_obs_params = self.obs_manager.get_obstacle_parameters()
         for j in range(self._N + 1):
@@ -406,7 +447,19 @@ class AttitudeMPC(Controller):
                 size=0.03,
             )
 
-        draw_line(sim, self._trajectory_planner.waypoints_pos, rgba=(0.0, 1.0, 0.5, 0.5))
+        if hasattr(self._trajectory_planner, "traj_pos"):
+            traj_vis = self._trajectory_planner.traj_pos[:: max(1, len(self._trajectory_planner.traj_pos) // 80)]
+            draw_line(sim, traj_vis, rgba=(0.0, 0.8, 0.2, 0.7))
+        if hasattr(self._trajectory_planner, "basic_spline_pos"):
+            basic_vis = self._trajectory_planner.basic_spline_pos[:: max(1, len(self._trajectory_planner.basic_spline_pos) // 80)]
+            draw_line(sim, basic_vis, rgba=(1.0, 0.0, 0.0, 0.5))
+        if hasattr(self._trajectory_planner, "waypoints_pos"):
+            draw_points(
+                sim,
+                self._trajectory_planner.waypoints_pos,
+                rgba=(1.0, 0.85, 0.0, 1.0),
+                size=0.04,
+            )
         # Draw the obstacles (Red Transparent Capsules)
         self.obs_manager.render(sim)
 

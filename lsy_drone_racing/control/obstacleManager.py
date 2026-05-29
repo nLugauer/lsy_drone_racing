@@ -289,6 +289,57 @@ class ObstacleManager:
             )
             self._nominal_obstacle_indices.append(obs_idx)
 
+    def initialize_track(self, track_config: object | None) -> None:
+        """Initialize gates and obstacles from the environment track configuration."""
+        self.obstacles = []
+        self.gates = []
+        self._gate_obstacle_indices = []
+        self._nominal_obstacle_indices = []
+
+        if track_config is None:
+            self.initialize_nominal_track()
+            return
+
+        gates = getattr(track_config, "gates", None)
+        if gates is None and isinstance(track_config, dict):
+            gates = track_config.get("gates", None)
+
+        obstacles = getattr(track_config, "obstacles", None)
+        if obstacles is None and isinstance(track_config, dict):
+            obstacles = track_config.get("obstacles", None)
+
+        if gates is None or len(gates) == 0:
+            self.initialize_nominal_track()
+            return
+
+        for gate in gates:
+            gate_pos = np.asarray(gate["pos"], dtype=np.float64)
+            gate_rpy = np.asarray(gate["rpy"], dtype=np.float64)
+            inner_width = float(
+                gate.get("inner_width", 0.4)
+                if isinstance(gate, dict)
+                else getattr(gate, "inner_width", 0.4)
+            )
+            outer_width = float(
+                gate.get("outer_width", 0.72)
+                if isinstance(gate, dict)
+                else getattr(gate, "outer_width", 0.72)
+            )
+            self.add_gate(
+                pos=gate_pos, rpy=gate_rpy, inner_width=inner_width, outer_width=outer_width
+            )
+
+        if obstacles is not None:
+            for obstacle in obstacles:
+                obstacle_pos = np.asarray(obstacle["pos"], dtype=np.float64)
+                start_point = np.array([obstacle_pos[0], obstacle_pos[1], 0.0], dtype=np.float64)
+                end_point = np.array(
+                    [obstacle_pos[0], obstacle_pos[1], obstacle_pos[2]], dtype=np.float64
+                )
+                obs_idx = len(self.obstacles)
+                self.add_cylinder(start=start_point, end=end_point, radius=0.015)
+                self._nominal_obstacle_indices.append(obs_idx)
+
     def get_obstacle_parameters(self) -> np.ndarray:
         """Flattens current obstacle coordinates into a 1D array for the solver."""
         params = []

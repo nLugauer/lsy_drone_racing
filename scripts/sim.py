@@ -10,12 +10,32 @@ Look for instructions in `README.md` and in the official documentation.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fire
 import gymnasium
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# Ensure acados finds the local source tree and shared libraries at runtime.
+if 'ACADOS_SOURCE_DIR' not in os.environ:
+    os.environ['ACADOS_SOURCE_DIR'] = str(ROOT_DIR / 'acados')
+acados_lib_paths = [
+    str(ROOT_DIR / 'acados' / 'lib'),
+    str(ROOT_DIR / 'acados' / 'build' / 'external' / 'qpoases' / 'lib'),
+]
+existing_ld_library_path = os.environ.get('LD_LIBRARY_PATH', '')
+existing_paths = existing_ld_library_path.split(':') if existing_ld_library_path else []
+for path in acados_lib_paths:
+    if path not in existing_paths:
+        existing_paths.insert(0, path)
+os.environ['LD_LIBRARY_PATH'] = ':'.join(existing_paths)
 
 from lsy_drone_racing.utils import load_config, load_controller
 
