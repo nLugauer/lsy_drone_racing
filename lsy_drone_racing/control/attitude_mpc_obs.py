@@ -9,7 +9,7 @@ Note that the trajectory uses pre-defined waypoints instead of dynamically gener
 
 from __future__ import annotations  # Python 3.10 type hints
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import casadi as ca
 import numpy as np
@@ -97,15 +97,15 @@ def create_ocp_solver(
     # State weights
     Q = np.diag(
         [
+            75.0,  # pos
+            75.0,  # pos
             200.0,  # pos
-            200.0,  # pos
-            200.0,  # pos
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
-            10.0,  # vel
-            10.0,  # vel
-            10.0,  # vel
+            2.0,  # rpy
+            2.0,  # rpy
+            2.0,  # rpy
+            15.0,  # vel
+            15.0,  # vel
+            15.0,  # vel
             5.0,  # drpy
             5.0,  # drpy
             5.0,  # drpy
@@ -167,7 +167,7 @@ def create_ocp_solver(
 
         # --- SLACK PENALTIES ---
         # Path penalties
-        ocp.cost.Zl = 8e4 * np.ones(nh)
+        ocp.cost.Zl = 6e4 * np.ones(nh)
         ocp.cost.Zu = np.zeros(nh)
         ocp.cost.zl = 1e4 * np.ones(nh)
         ocp.cost.zu = np.zeros(nh)
@@ -215,6 +215,14 @@ def create_ocp_solver(
 class AttitudeMPC(Controller):
     """Example of a MPC using the collective thrust and attitude interface."""
 
+    @staticmethod
+    def _read_config_value(config_obj: object | dict, field: str, default: Any) -> Any:
+        if config_obj is None:
+            return default
+        if isinstance(config_obj, dict):
+            return config_obj.get(field, default)
+        return getattr(config_obj, field, default)
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
 
@@ -225,23 +233,40 @@ class AttitudeMPC(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
-        self._N = 30
+        self._N = 20
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
-        self.obs_manager = ObstacleManager(safety_margin=0.15)
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
+        self._obstacle_safety_margin = float(
+            self._read_config_value(config.env, "obstacle_safety_margin", 0.085)
+        )
+        self.obs_manager = ObstacleManager(safety_margin=self._obstacle_safety_margin)
         self.obs_manager.initialize_track(config.env.track)
         self._observed_gate_positions: np.ndarray | None = None
         self._observed_obstacle_positions: np.ndarray | None = None
+        self._latest_gate_positions: np.ndarray | None = None
+        self._last_target_gate: int | None = None
 
         gate_polygons = self.obs_manager.get_togt_polygons(config.env.track)
         start_pos = np.asarray(obs["pos"], dtype=np.float64)
 
+        planner_approach_dist = self._read_config_value(config.env, "approach_dist", None)
+        if planner_approach_dist is None:
+            planner_approach_dist = float(self.drone_params.get("approach_dist", 0.08))
+
         self._trajectory_planner = TOGTPlanner(
-            gate_polygons, parameters=self.drone_params, freq=config.env.freq, start_pos=start_pos
+            gate_polygons,
+            parameters=self.drone_params,
+            freq=config.env.freq,
+            start_pos=start_pos,
+            approach_dist=planner_approach_dist,
         )
         self._trajectory_planner.plan_trajectory()
+        if "target_gate" in obs:
+            self._last_target_gate = int(np.asarray(obs["target_gate"]).item())
+        if "gates_pos" in obs:
+            self._latest_gate_positions = np.asarray(obs["gates_pos"], dtype=np.float64)
 
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, self.obs_manager
@@ -306,6 +331,24 @@ class AttitudeMPC(Controller):
                 self._path_history.pop(0)
 
         self._refresh_obstacle_gate_positions(obs)
+        if "target_gate" in obs:
+            current_target_gate = int(np.asarray(obs["target_gate"]).item())
+            if self._last_target_gate is not None and current_target_gate != self._last_target_gate:
+                if current_target_gate == -1:
+                    print(f"Passed final gate {self._last_target_gate}")
+                elif current_target_gate > self._last_target_gate:
+                    print(
+                        f"Passed gate {self._last_target_gate}; "
+                        f"next target gate {current_target_gate}"
+                    )
+                else:
+                    print(
+                        f"Target gate changed from {self._last_target_gate} "
+                        f"to {current_target_gate}"
+                    )
+            self._last_target_gate = current_target_gate
+        if "gates_pos" in obs:
+            self._latest_gate_positions = np.asarray(obs["gates_pos"], dtype=np.float64)
 
         if self._tick >= self._tick_max:
             self._finished = True
@@ -412,6 +455,31 @@ class AttitudeMPC(Controller):
             draw_points(
                 sim, self._trajectory_planner.waypoints_pos, rgba=(1.0, 0.85, 0.0, 1.0), size=0.04
             )
+        if self._latest_gate_positions is not None:
+            if self._last_target_gate == -1:
+                draw_points(sim, self._latest_gate_positions, rgba=(0.0, 1.0, 0.0, 1.0), size=0.05)
+            else:
+                gate_indices = np.arange(self._latest_gate_positions.shape[0])
+                passed_mask = (
+                    gate_indices < self._last_target_gate
+                    if self._last_target_gate is not None
+                    else np.zeros(self._latest_gate_positions.shape[0], dtype=bool)
+                )
+                if np.any(passed_mask):
+                    draw_points(
+                        sim,
+                        self._latest_gate_positions[passed_mask],
+                        rgba=(0.0, 1.0, 0.0, 1.0),
+                        size=0.05,
+                    )
+                remaining_mask = ~passed_mask
+                if np.any(remaining_mask):
+                    draw_points(
+                        sim,
+                        self._latest_gate_positions[remaining_mask],
+                        rgba=(1.0, 0.0, 0.0, 1.0),
+                        size=0.05,
+                    )
         # Draw the obstacles (Red Transparent Capsules)
         self.obs_manager.render(sim)
 

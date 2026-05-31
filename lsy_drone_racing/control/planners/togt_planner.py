@@ -21,6 +21,7 @@ class TOGTPlanner(BasePlanner):
         parameters: dict,
         freq: int,
         start_pos: np.ndarray | list[float] | None = None,
+        approach_dist: float | None = None,
     ) -> None:
         """Initialize the TOGT planner with gate data and drone parameters.
 
@@ -29,6 +30,7 @@ class TOGTPlanner(BasePlanner):
             parameters: Drone parameters including mass and thrust limits.
             freq: Reference generation frequency in Hz.
             start_pos: Initial drone position in world coordinates.
+            approach_dist: Distance before and after each gate used for waypoint shaping.
         """
         super().__init__(freq)
         self.params = parameters
@@ -37,6 +39,13 @@ class TOGTPlanner(BasePlanner):
         self.start_pos = (
             np.asarray(start_pos, dtype=np.float64) if start_pos is not None else np.zeros(3)
         )
+
+        self.approach_dist = (
+            float(approach_dist)
+            if approach_dist is not None
+            else float(self.params.get("approach_dist", 0.08))
+        )
+        self.thrust_max_total = float(self.params["thrust_max"]) * 4.0 * 0.55
 
         # Polynomial order and resolution for constraint checking (Eq. 12)
         self.s = 5
@@ -134,9 +143,8 @@ class TOGTPlanner(BasePlanner):
             tilt_violation = ca.fmax(cos_phi_min - cos_phi, 0)
 
             # Eq 12 Penalty: max(h(x,u), 0)^3
-            # Limit: f_i <= f_max -> thrust <= 4 * f_max
-            max_thrust = self.params["thrust_max"] * 4
-            thrust_violation = ca.fmax(thrust - max_thrust, 0)
+            # Limit: f_i <= f_max -> thrust <= thrust_max_total
+            thrust_violation = ca.fmax(thrust - self.thrust_max_total, 0)
 
             I_T += (thrust_violation**3 + 1e3 * tilt_violation**3) * dt
 
@@ -156,7 +164,7 @@ class TOGTPlanner(BasePlanner):
         evaluated at a small number of points for smoothness, but the path is
         defined mainly by the gate centers.
         """
-        waypoints = self._get_augmented_waypoints(approach_dist=0.05)
+        waypoints = self._get_augmented_waypoints(approach_dist=self.approach_dist)
         t_nodes = np.linspace(0.0, 1.0, len(waypoints))
         spline = CubicSpline(t_nodes, waypoints, axis=0, bc_type="clamped")
         t_dense = np.linspace(0.0, 1.0, (len(waypoints) - 1) * num_samples_per_segment + 1)
@@ -173,16 +181,23 @@ class TOGTPlanner(BasePlanner):
             # The normal vector pointing strictly forward through the gate
             normal = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float64)
 
-            # Add a point before the gate, the gate itself, and a point after
-            waypoints.append((origin - approach_dist * normal).reshape(1, 3))
+            # Add the gate itself and a point after it to enforce direction
             waypoints.append(origin.reshape(1, 3))
             waypoints.append((origin + approach_dist * normal).reshape(1, 3))
+
+        if len(self.gates) > 0:
+            last_gate = self.gates[-1]
+            last_origin = np.asarray(last_gate["origin"])
+            last_yaw = last_gate.get("yaw", 0.0)
+            last_normal = np.array([np.cos(last_yaw), np.sin(last_yaw), 0.0], dtype=np.float64)
+            final_overshoot = approach_dist + 0.30
+            waypoints.append((last_origin + final_overshoot * last_normal).reshape(1, 3))
 
         return np.vstack(waypoints)
 
     def _build_basic_spline_path(self) -> np.ndarray:
         """Build a high-resolution reference spline for plotting."""
-        waypoints = self._get_augmented_waypoints(approach_dist=0.05)
+        waypoints = self._get_augmented_waypoints(approach_dist=self.approach_dist)
         t_nodes = np.linspace(0.0, 1.0, len(waypoints))
         spline = CubicSpline(t_nodes, waypoints, axis=0, bc_type="clamped")
         t_plot = np.linspace(0.0, 1.0, max(200, (len(waypoints) - 1) * 20 + 1))
@@ -190,7 +205,7 @@ class TOGTPlanner(BasePlanner):
 
     def _max_horizontal_acceleration(self) -> float:
         """Estimate the maximum available horizontal acceleration from thrust."""
-        thrust_total = float(self.params["thrust_max"] * 4)
+        thrust_total = self.thrust_max_total
         mass = float(self.params["mass"])
         gravity = abs(float(self.params["gravity_vec"][-1]))
         specific_thrust = thrust_total / mass
@@ -212,7 +227,7 @@ class TOGTPlanner(BasePlanner):
         self.basic_spline_pos = self._build_basic_spline_path()
 
         # self.waypoints_pos = self._build_basic_spline_waypoints(num_samples_per_segment=0)
-        self.waypoints_pos = self._get_augmented_waypoints(approach_dist=0.05)
+        self.waypoints_pos = self._get_augmented_waypoints(approach_dist=self.approach_dist)
 
         distances = np.linalg.norm(np.diff(self.waypoints_pos, axis=0), axis=1)
         segment_times = self._segment_times_from_dynamics(distances)

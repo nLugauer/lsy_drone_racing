@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import fire
 import gymnasium
+import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
 from lsy_drone_racing.utils import load_config, load_controller
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level0.toml",
+    config: str = "level2.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -96,6 +97,7 @@ def simulate(
     for _ in range(n_runs):  # Run n_runs episodes with the controller
         obs, info = env.reset()
         controller: Controller = controller_cls(obs, info, config)
+        prev_target_gate = int(np.asarray(obs["target_gate"]).item())
         i = 0
         fps = 60
 
@@ -105,6 +107,15 @@ def simulate(
             action = controller.compute_control(obs, info)
 
             obs, reward, terminated, truncated, info = env.step(action)
+            current_target_gate = int(np.asarray(obs["target_gate"]).item())
+            if current_target_gate != prev_target_gate:
+                if current_target_gate == -1:
+                    print(f"Passed final gate {prev_target_gate}")
+                elif current_target_gate > prev_target_gate:
+                    print(f"Passed gate {prev_target_gate}; next target gate {current_target_gate}")
+                else:
+                    print(f"Target gate changed from {prev_target_gate} to {current_target_gate}")
+                prev_target_gate = current_target_gate
             # Update the controller internal state and models.
             controller_finished = controller.step_callback(
                 action, obs, reward, terminated, truncated, info
