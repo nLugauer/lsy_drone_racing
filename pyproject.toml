@@ -33,7 +33,6 @@ sim = [
     "drone-models",
     "drone-controllers",
     "crazyflow>=0.1.0",
-    "acados_template",
     "jax >= 0.7",
     "warp-lang",
 ]
