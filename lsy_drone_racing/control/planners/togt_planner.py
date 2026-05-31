@@ -7,6 +7,7 @@ actuator limits, and uses spatial mappings for gate boundaries.
 
 import casadi as ca
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 from .base_planner import BasePlanner
 
@@ -33,7 +34,9 @@ class TOGTPlanner(BasePlanner):
         self.params = parameters
         self.gates = gates_data
         self.L = len(gates_data)
-        self.start_pos = np.asarray(start_pos, dtype=np.float64) if start_pos is not None else np.zeros(3)
+        self.start_pos = (
+            np.asarray(start_pos, dtype=np.float64) if start_pos is not None else np.zeros(3)
+        )
 
         # Polynomial order and resolution for constraint checking (Eq. 12)
         self.s = 5
@@ -145,32 +148,48 @@ class TOGTPlanner(BasePlanner):
         self.f_obj = ca.Function("f_obj", [vars_cat], [self.objective])
         self.f_grad = ca.Function("f_grad", [vars_cat], [ca.gradient(self.objective, vars_cat)])
 
-    def _build_basic_spline_waypoints(self, num_samples_per_segment: int = 15) -> np.ndarray:
-        """Build the dense waypoint sequence from a basic spline through start and gate centers."""
-        from scipy.interpolate import CubicSpline
+    def _build_basic_spline_waypoints(self, num_samples_per_segment: int = 2) -> np.ndarray:
+        """Build a compact waypoint sequence from a spline through start and gate centers.
 
-        waypoints = np.vstack([self.start_pos.reshape(1, 3), np.array([gate["origin"] for gate in self.gates])])
+        We intentionally keep the waypoint count low here so the planner does not
+        create an overly dense reference trajectory. The cubic spline is still
+        evaluated at a small number of points for smoothness, but the path is
+        defined mainly by the gate centers.
+        """
+        waypoints = self._get_augmented_waypoints(approach_dist=0.05)
         t_nodes = np.linspace(0.0, 1.0, len(waypoints))
         spline = CubicSpline(t_nodes, waypoints, axis=0, bc_type="clamped")
         t_dense = np.linspace(0.0, 1.0, (len(waypoints) - 1) * num_samples_per_segment + 1)
         return spline(t_dense)
 
+    def _get_augmented_waypoints(self, approach_dist: float = 0.15) -> np.ndarray:
+        """Add waypoints including pre- and post-gate approach points to enforce direction."""
+        waypoints = [self.start_pos.reshape(1, 3)]
+
+        for gate in self.gates:
+            origin = np.asarray(gate["origin"])
+            yaw = gate.get("yaw", 0.0)
+
+            # The normal vector pointing strictly forward through the gate
+            normal = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float64)
+
+            # Add a point before the gate, the gate itself, and a point after
+            waypoints.append((origin - approach_dist * normal).reshape(1, 3))
+            waypoints.append(origin.reshape(1, 3))
+            waypoints.append((origin + approach_dist * normal).reshape(1, 3))
+
+        return np.vstack(waypoints)
+
     def _build_basic_spline_path(self) -> np.ndarray:
         """Build a high-resolution reference spline for plotting."""
-        from scipy.interpolate import CubicSpline
-
-        waypoints = np.vstack([self.start_pos.reshape(1, 3), np.array([gate["origin"] for gate in self.gates])])
+        waypoints = self._get_augmented_waypoints(approach_dist=0.05)
         t_nodes = np.linspace(0.0, 1.0, len(waypoints))
         spline = CubicSpline(t_nodes, waypoints, axis=0, bc_type="clamped")
         t_plot = np.linspace(0.0, 1.0, max(200, (len(waypoints) - 1) * 20 + 1))
         return spline(t_plot)
 
     def _max_horizontal_acceleration(self) -> float:
-        """Estimate the maximum available horizontal acceleration from thrust.
-
-        Uses the same thrust bound as the controller: total thrust is
-        four times the per-motor thrust max.
-        """
+        """Estimate the maximum available horizontal acceleration from thrust."""
         thrust_total = float(self.params["thrust_max"] * 4)
         mass = float(self.params["mass"])
         gravity = abs(float(self.params["gravity_vec"][-1]))
@@ -180,41 +199,32 @@ class TOGTPlanner(BasePlanner):
         return float(np.sqrt(max(specific_thrust**2 - gravity**2, 0.0)))
 
     def _segment_times_from_dynamics(self, distances: np.ndarray) -> np.ndarray:
-        """Compute segment timing using available horizontal acceleration.
-
-        Uses a conservative speed cap so the initial trajectory is not too aggressive
-        for the attitude controller to follow.
-        """
+        """Compute segment timing using available horizontal acceleration."""
         a_horiz = self._max_horizontal_acceleration()
-        max_speed = 1.2
-        min_segment_time = 0.75
+        max_speed = 3.0
         if a_horiz <= 0.0:
-            return np.maximum(distances / max_speed, min_segment_time)
+            return distances / max_speed
         times = np.sqrt(4.0 * distances / a_horiz)
-        return np.maximum(np.maximum(times, distances / max_speed), min_segment_time)
+        return np.maximum(times, distances / max_speed)
 
     def plan_trajectory(self) -> None:
-        """Generate a smooth reference trajectory through the gates.
-
-        The planner uses the actual gate origins from the track and creates a
-        time-parameterized cubic spline with reasonable segment durations.
-        """
+        """Plan the trajectory by solving the unconstrained optimization problem."""
         self.basic_spline_pos = self._build_basic_spline_path()
-        self.waypoints_pos = self._build_basic_spline_waypoints(num_samples_per_segment=12)
+
+        # self.waypoints_pos = self._build_basic_spline_waypoints(num_samples_per_segment=0)
+        self.waypoints_pos = self._get_augmented_waypoints(approach_dist=0.05)
 
         distances = np.linalg.norm(np.diff(self.waypoints_pos, axis=0), axis=1)
         segment_times = self._segment_times_from_dynamics(distances)
+
         t_nodes = np.concatenate([[0.0], np.cumsum(segment_times)])
         t_total = t_nodes[-1]
         self.t_total = float(t_total)
         print(f"TOGT planned trajectory duration: {self.t_total:.2f} seconds")
+
         self.t_fixed = np.linspace(0.0, t_total, int(np.ceil(t_total * self.freq)) + 1)
         self.max_ticks = len(self.t_fixed) - 1
 
-        from scipy.interpolate import CubicSpline
-
-        # Use clamped boundary conditions to avoid large undershoots/overshoots near the start
-        # and end of the trajectory. This keeps the takeoff and final gate approach smoother.
         bc_type = ((1, [0.0, 0.0, 0.0]), (1, [0.0, 0.0, 0.0]))
         spline = CubicSpline(t_nodes, self.waypoints_pos, axis=0, bc_type=bc_type)
         self.traj_pos = spline(self.t_fixed)

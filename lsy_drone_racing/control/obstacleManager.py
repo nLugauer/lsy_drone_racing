@@ -241,6 +241,73 @@ class ObstacleManager:
 
         return mask
 
+    def _extract_track_list(self, track_config: object | None, field: str) -> list:
+        """Helper to extract lists from track configs safely."""
+        if track_config is None:
+            return []
+        if hasattr(track_config, field):
+            return getattr(track_config, field)
+        if isinstance(track_config, dict):
+            return track_config.get(field, [])
+        try:
+            return track_config[field]
+        except Exception:
+            return []
+
+    def get_togt_polygons(self, track_config: object | None) -> list[dict[str, np.ndarray]]:
+        """Builds the polygon representations of the gates for the TOGT planner."""
+        gates = self._extract_track_list(track_config, "gates")
+        gate_polygons = []
+
+        for gate in gates:
+            gate_pos = np.asarray(gate["pos"], dtype=np.float64)
+            gate_rpy = np.asarray(gate["rpy"], dtype=np.float64)
+            yaw = float(gate_rpy[2])
+
+            inner_width = float(
+                gate.get("inner_width", 0.4)
+                if isinstance(gate, dict)
+                else getattr(gate, "inner_width", 0.4)
+            )
+            inner_height = float(
+                gate.get("inner_height", inner_width)
+                if isinstance(gate, dict)
+                else getattr(gate, "inner_height", inner_width)
+            )
+            gate_margin = float(
+                gate.get("drone_margin", 0.0)
+                if isinstance(gate, dict)
+                else getattr(gate, "drone_margin", 0.0)
+            )
+
+            effective_width = max(0.0, inner_width - 2.0 * gate_margin)
+            effective_height = max(0.0, inner_height - 2.0 * gate_margin)
+            half_width = effective_width / 2.0
+            half_height = effective_height / 2.0
+
+            local_corners = [
+                np.array([0.0, -half_width, half_height], dtype=np.float64),
+                np.array([0.0, half_width, half_height], dtype=np.float64),
+                np.array([0.0, half_width, -half_height], dtype=np.float64),
+                np.array([0.0, -half_width, -half_height], dtype=np.float64),
+            ]
+
+            R_mat = np.array(
+                [
+                    [np.cos(yaw), -np.sin(yaw), 0.0],
+                    [np.sin(yaw), np.cos(yaw), 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+
+            world_corners = [(R_mat @ corner) + gate_pos for corner in local_corners]
+            V = np.column_stack([corner - gate_pos for corner in world_corners])
+
+            gate_polygons.append({"type": "polygon", "origin": gate_pos, "V": V, "yaw": yaw})
+
+        return gate_polygons
+
     def initialize_nominal_track(self) -> None:
         """Hardcodes the nominal positions of gates and obstacles for Level 0.
 
