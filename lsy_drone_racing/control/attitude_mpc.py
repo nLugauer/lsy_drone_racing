@@ -28,16 +28,11 @@ if TYPE_CHECKING:
 
 def create_acados_model(parameters: dict) -> AcadosModel:
     """Creates an acados model from a symbolic drone_model."""
-    # For more info on the models, check out https://github.com/learnsyslab/drone-models
     # Build base symbolic variables (outside the read-only drone-models library)
-    # Base states: pos(3), rpy(3), vel(3), drpy(3) => 12
     x_base = ca.SX.sym("x_base", 12, 1)
-    # Base inputs: rpy_cmd(3), thrust(1) => 4
     u_base = ca.SX.sym("u_base", 4, 1)
 
-    # Call the library helper to get the base dynamics expression (it returns expressions
-    # built with its own internal CasADi symbols). We'll substitute the internal symbols
-    # with our externally-created symbols to keep the read-only library untouched.
+    # Call the library helper to get the base dynamics expression
     X_dot_lib, X_lib, U_lib, _ = symbolic_dynamics_euler(
         mass=parameters["mass"],
         gravity_vec=parameters["gravity_vec"],
@@ -51,7 +46,6 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     )
 
     # Substitute library-internal state/input symbols with our x_base / u_base symbols
-    # NOTE: symbolic_dynamics_euler returns casadi SX/MX objects; ca.substitute handles SX
     X_dot_base = ca.substitute(X_dot_lib, X_lib, x_base)
     X_dot_base = ca.substitute(X_dot_base, U_lib, u_base)
 
@@ -77,34 +71,54 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.f_expl_expr = x_dot_aug
     model.f_impl_expr = None
 
-    # Define model parameter vector p to carry cubic polynomial coefficients for the
-    # current spline segment (4 coeffs per x,y,z => 12) plus a contouring weight q_c => 13
+    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c)
     model.p = ca.SX.sym("p", 13)
-
-    # Build a placeholder residual expression for nonlinear least squares cost.
-    # p layout: [x_c3,x_c2,x_c1,x_c0, y_c3,..y_c0, z_c3..z_c0, q_c]
     px = model.p[0:4]
     py = model.p[4:8]
     pz = model.p[8:12]
     q_c = model.p[12]
 
-    # theta is the last-but-one state in x_aug
     theta_sym = x_aug[12]
     v_theta_sym = x_aug[13]
 
-    # Evaluate cubic polynomial at theta (here assumed to be local segment parameter)
-    # polynomial is px[0]*theta^3 + px[1]*theta^2 + px[2]*theta + px[3]
+    # ----------------------------------------------------------------------
+    # EXACT MPCC MATH (Section III-D: Derivation of Contour and Lag Errors)
+    # ----------------------------------------------------------------------
+
+    # Equation 8: Evaluate nominal path p^d(theta_k)
     theta_pows = ca.vertcat(theta_sym**3, theta_sym**2, theta_sym, ca.SX(1.0))
     pos_ref = ca.vertcat(ca.dot(px, theta_pows), ca.dot(py, theta_pows), ca.dot(pz, theta_pows))
 
-    # Residual: cartesian error (pos - pos_ref), appended with control inputs and -v_theta (we will
-    # try to maximize progress by minimizing -v_theta, so include -v_theta in residual)
-    residual_pos = x_aug[0:3] - pos_ref
-    residual_u = u_aug[0:4]
-    residual_vtheta = -v_theta_sym
+    # Equation 9: Calculate tangent t(theta_k) = dp^d(theta_k)/dtheta_k
+    theta_dot_pows = ca.vertcat(3 * theta_sym**2, 2 * theta_sym, ca.SX(1.0), ca.SX(0.0))
+    t_vec = ca.vertcat(
+        ca.dot(px, theta_dot_pows), ca.dot(py, theta_dot_pows), ca.dot(pz, theta_dot_pows)
+    )
 
-    # final cost_y_expr. Size: 3 (pos) + 4 (u) + 1 (-v_theta) = 8
-    model.cost_y_expr = ca.vertcat(residual_pos, residual_u, residual_vtheta)
+    # The paper assumes perfect arc-length parameterization (||t|| = 1).
+    # Since cubic splines fluctuate slightly, we explicitly normalize to prevent math breakdown.
+    t_norm = t_vec / (ca.norm_2(t_vec) + 1e-6)
+
+    # Position Error: e(theta_k) = p_k - p^d(theta_k)
+    e_pos = x_aug[0:3] - pos_ref
+
+    # Equation 10: Lag Error e^l(theta_k)
+    e_lag_scalar = ca.dot(e_pos, t_norm)
+    e_lag_vec = e_lag_scalar * t_norm
+
+    # Equation 11: Contour Error e^c(theta_k)
+    e_cont_vec = e_pos - e_lag_vec
+
+    # Dynamic Weighting Integration:
+    # To apply the dynamic contour weight q_c inside a Least Squares formulation,
+    # we multiply the vector by sqrt(q_c) so that squaring it yields q_c * ||e^c||^2
+    weighted_e_cont = ca.sqrt(q_c) * e_cont_vec
+
+    # Final cost_y_expr. Size: 3 (Contour) + 1 (Lag) + 4 (u_base) + 1 (v_theta) = 9
+    model.cost_y_expr = ca.vertcat(weighted_e_cont, e_lag_scalar, u_aug[0:4], v_theta_sym)
+
+    # Terminal cost expression (Size 4: Contour + Lag)
+    model.cost_y_expr_e = ca.vertcat(weighted_e_cont, e_lag_scalar)
 
     return model
 
@@ -123,8 +137,8 @@ def create_ocp_solver(
     nu = ocp.model.u.rows()
     # For NONLINEAR_LS cost we rely on the model.cost_y_expr size
     ny = int(ocp.model.cost_y_expr.rows())
-    # terminal residual -- for simplicity we use position-only terminal residual size 3
-    ny_e = 3
+    # terminal residual
+    ny_e = int(ocp.model.cost_y_expr_e.rows())
 
     # Set dimensions
     ocp.solver_options.N_horizon = N
@@ -166,18 +180,27 @@ def create_ocp_solver(
         ]
     )
 
-    # For nonlinear LS, define a simple weighting for the residual vector
-    W = np.eye(ny)
-    # Increase position residual weight (first 3 entries)
-    W[0:3, 0:3] = np.eye(3) * 100.0
+    W = np.zeros((ny, ny))
+    # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
+    W[0:3, 0:3] = np.eye(3) * 1.0  # The actual weight is driven dynamically by q_c in the model
+    W[3, 3] = 100.0  # High constant weight q_l to keep the virtual state tied to reality
+    W[4:8, 4:8] = np.diag([1.0, 1.0, 1.0, 50.0])  # Control regularization R
+    W[8, 8] = 500.0  # Progress weight mu
     ocp.cost.W = W
 
-    # Terminal weight (only position in this simple skeleton)
-    W_e = np.eye(ny_e) * 200.0
+    # Terminal weights
+    W_e = np.zeros((ny_e, ny_e))
+    W_e[0:3, 0:3] = np.eye(3) * 10.0  # Terminal contour
+    W_e[3, 3] = 100.0  # Terminal lag
     ocp.cost.W_e = W_e
 
-    # Set initial references (yref is zero since residual encodes errors)
-    ocp.cost.yref = np.zeros((ny,))
+    # Set initial references.
+    yref = np.zeros((ny,))
+    # Here is the trick: set the reference for v_theta (index 8) to a high target speed.
+    # The solver will minimize (v_theta - 15.0)^2, pushing the drone to go faster.
+    yref[8] = 15.0
+    ocp.cost.yref = yref
+
     ocp.cost.yref_e = np.zeros((ny_e,))
 
     # Hook up model nonlinear residuals to ocp (acados_template expects model.cost_y_expr)
