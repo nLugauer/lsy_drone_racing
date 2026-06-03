@@ -12,8 +12,10 @@ from __future__ import annotations  # Python 3.10 type hints
 from typing import TYPE_CHECKING
 
 import casadi as ca
+import matplotlib.pyplot as plt
 import numpy as np
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.so_rpy import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
@@ -23,14 +25,15 @@ from scipy.spatial.transform import Rotation as R
 from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
+    from crazyflow import Sim
     from numpy.typing import NDArray
 
 
 def create_acados_model(parameters: dict) -> AcadosModel:
     """Creates an acados model from a symbolic drone_model."""
     # Build base symbolic variables (outside the read-only drone-models library)
-    x_base = ca.SX.sym("x_base", 12, 1)
-    u_base = ca.SX.sym("u_base", 4, 1)
+    x_base = ca.MX.sym("x_base", 12, 1)
+    u_base = ca.MX.sym("u_base", 4, 1)
 
     # Call the library helper to get the base dynamics expression
     X_dot_lib, X_lib, U_lib, _ = symbolic_dynamics_euler(
@@ -50,9 +53,9 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     X_dot_base = ca.substitute(X_dot_base, U_lib, u_base)
 
     # MPCC augmentation: add virtual progress states theta and v_theta, and virtual input a_theta
-    theta = ca.SX.sym("theta")
-    v_theta = ca.SX.sym("v_theta")
-    a_theta = ca.SX.sym("a_theta")
+    theta = ca.MX.sym("theta")
+    v_theta = ca.MX.sym("v_theta")
+    a_theta = ca.MX.sym("a_theta")
 
     # Derivatives for augmented states
     theta_dot = v_theta
@@ -71,33 +74,37 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.f_expl_expr = x_dot_aug
     model.f_impl_expr = None
 
-    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c)
-    model.p = ca.SX.sym("p", 13)
+    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c + 1 local offset)
+    model.p = ca.MX.sym("p", 14)
     px = model.p[0:4]
     py = model.p[4:8]
     pz = model.p[8:12]
     q_c = model.p[12]
+    theta_offset = model.p[13]
 
     theta_sym = x_aug[12]
     v_theta_sym = x_aug[13]
+
+    # Local parameter within the current segment to avoid large absolute powers
+    d_theta = theta_sym - theta_offset
 
     # ----------------------------------------------------------------------
     # EXACT MPCC MATH (Section III-D: Derivation of Contour and Lag Errors)
     # ----------------------------------------------------------------------
 
-    # Equation 8: Evaluate nominal path p^d(theta_k)
-    theta_pows = ca.vertcat(theta_sym**3, theta_sym**2, theta_sym, ca.SX(1.0))
+    # Equation 8: Evaluate nominal path p^d(d_theta)
+    theta_pows = ca.vertcat(d_theta**3, d_theta**2, d_theta, ca.MX(1.0))
     pos_ref = ca.vertcat(ca.dot(px, theta_pows), ca.dot(py, theta_pows), ca.dot(pz, theta_pows))
 
-    # Equation 9: Calculate tangent t(theta_k) = dp^d(theta_k)/dtheta_k
-    theta_dot_pows = ca.vertcat(3 * theta_sym**2, 2 * theta_sym, ca.SX(1.0), ca.SX(0.0))
+    # Equation 9: Calculate tangent t(d_theta) = dp^d(d_theta)/dd_theta
+    theta_dot_pows = ca.vertcat(3 * d_theta**2, 2 * d_theta, ca.MX(1.0), ca.MX(0.0))
     t_vec = ca.vertcat(
         ca.dot(px, theta_dot_pows), ca.dot(py, theta_dot_pows), ca.dot(pz, theta_dot_pows)
     )
 
     # The paper assumes perfect arc-length parameterization (||t|| = 1).
     # Since cubic splines fluctuate slightly, we explicitly normalize to prevent math breakdown.
-    t_norm = t_vec / (ca.norm_2(t_vec) + 1e-6)
+    t_norm = t_vec / ca.sqrt(ca.sumsqr(t_vec) + 1e-4)
 
     # Position Error: e(theta_k) = p_k - p^d(theta_k)
     e_pos = x_aug[0:3] - pos_ref
@@ -154,16 +161,18 @@ def create_ocp_solver(
 
     W = np.zeros((ny, ny))
     # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
-    W[0:3, 0:3] = np.eye(3) * 1.0  # The actual weight is driven dynamically by q_c in the model
-    W[3, 3] = 100.0  # High constant weight q_l to keep the virtual state tied to reality
+    W[0:3, 0:3] = np.diag(
+        [50.0, 50.0, 400.0]
+    )  # The actual weight is driven dynamically by q_c in the model
+    W[3, 3] = 400.0  # High constant weight q_l to keep the virtual state tied to reality
     W[4:8, 4:8] = np.diag([1.0, 1.0, 1.0, 50.0])  # Control regularization R
-    W[8, 8] = 500.0  # Progress weight mu
+    W[8, 8] = 50.0  # Progress weight mu
     ocp.cost.W = W
 
     # Terminal weights
     W_e = np.zeros((ny_e, ny_e))
-    W_e[0:3, 0:3] = np.eye(3) * 10.0  # Terminal contour
-    W_e[3, 3] = 100.0  # Terminal lag
+    W_e[0:3, 0:3] = np.diag([50.0, 50.0, 400.0])  # Terminal contour
+    W_e[3, 3] = 400.0  # Terminal lag
     ocp.cost.W_e = W_e
 
     # Set initial references.
@@ -171,22 +180,15 @@ def create_ocp_solver(
     # Here is the trick: set the reference for v_theta (index 8) to a high target speed.
     # The solver will minimize (v_theta - 15.0)^2, pushing the drone to go faster.
     yref[8] = 15.0
+    # Prevent the optimizer from collapsing thrust to zero by targeting hover thrust.
+    yref[7] = parameters["mass"] * np.linalg.norm(parameters["gravity_vec"])
     ocp.cost.yref = yref
 
     ocp.cost.yref_e = np.zeros((ny_e,))
 
-    # Hook up model nonlinear residuals to ocp (acados_template expects model.cost_y_expr)
+    # Hook up model nonlinear residuals to ocp
     ocp.model.cost_y_expr = ocp.model.cost_y_expr
-    # Terminal residual: position error between x[0:3] and the polynomial evaluated at theta
-    # Reconstruct terminal pos_ref expression using model symbols
-    p = ocp.model.p
-    px = p[0:4]
-    py = p[4:8]
-    pz = p[8:12]
-    theta_sym = ocp.model.x[12]
-    theta_pows = ca.vertcat(theta_sym**3, theta_sym**2, theta_sym, ca.SX(1.0))
-    pos_ref_e = ca.vertcat(ca.dot(px, theta_pows), ca.dot(py, theta_pows), ca.dot(pz, theta_pows))
-    ocp.model.cost_y_expr_e = ocp.model.x[0:3] - pos_ref_e
+    ocp.model.cost_y_expr_e = ocp.model.cost_y_expr_e
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
     ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5, 0.0])
@@ -194,7 +196,7 @@ def create_ocp_solver(
     ocp.constraints.idxbx = np.array([3, 4, 5, 13])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -10.0])
+    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, 0.0001])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 10.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
@@ -213,6 +215,8 @@ def create_ocp_solver(
 
     ocp.solver_options.qp_solver_iter_max = 20
     ocp.solver_options.nlp_solver_max_iter = 50
+
+    ocp.parameter_values = np.zeros((14,))
 
     # set prediction horizon
     ocp.solver_options.tf = Tf
@@ -247,6 +251,10 @@ class AttitudeMPC(Controller):
 
         self._current_theta = 0.0
         self._current_v_theta = 0.0
+        self._predicted_trajectory = np.zeros((self._N, 3))
+        self._log_z = []
+        self._log_target_z = []
+        self._log_thrust = []
 
         # Same waypoints as in the trajectory controller. Determined by trial and error.
         waypoints = np.array(
@@ -342,14 +350,20 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(0, "ubx", x0_aug)
 
         # For MPCC we provide the spline coefficients and a contouring weight in model.p.
-        # We will not use time-based yref trajectory anymore; set all yref entries to zero
-        yref_zero = np.zeros((self._ny,))
+        # Define the reference residual target with hover thrust and target speed
+        yref_target = np.zeros((self._ny,))
+        yref_target[7] = self.drone_params["mass"] * 9.81  # Hover thrust
+        yref_target[8] = 15.0  # Target progress speed (v_theta)
+
         for j in range(self._N):
-            self._acados_ocp_solver.set(j, "yref", yref_zero)
+            self._acados_ocp_solver.set(j, "yref", yref_target)
 
         # Terminal yref zero (size ny_e)
         yref_e_zero = np.zeros((self._ny_e,))
         self._acados_ocp_solver.set(self._N, "y_ref", yref_e_zero)
+
+        # current reference Z at the current virtual progress.
+        pos_ref_current = self._des_pos_spline(self._current_theta)
 
         # Prepare and set parameter vector p for each stage (polynomial coeffs + contour weight)
         # Extract cubic coefficients for the current segment from the CubicSpline object
@@ -373,15 +387,32 @@ class AttitudeMPC(Controller):
         dist_to_waypoint = np.linalg.norm(self._waypoints_pos[nearest_idx] - obs["pos"])
         q_c = 10.0 if dist_to_waypoint < 0.5 else 1.0
 
-        params = np.zeros((13,))
+        params = np.zeros((14,))
         params[0:4] = px.flatten()
         params[4:8] = py.flatten()
         params[8:12] = pz.flatten()
         params[12] = q_c
+        params[13] = self._des_pos_spline.x[seg_idx]
 
         # Set spline parameters stage-by-stage using predicted theta.
         for j in range(self._N):
-            theta_pred = self._current_theta + j * self._dt * self._current_v_theta
+            if self._tick == 0:
+                # Provide a kinematic guess for the very first tick to prevent divergence
+                theta_pred = (
+                    self._current_theta + j * self._dt * 2.0
+                )  # Assume 2.0 m/s initial progress
+                xj_guess = x0_aug.copy()
+                xj_guess[12] = theta_pred
+                xj_guess[13] = 2.0
+                hover_u = np.array([0.0, 0.0, 0.0, self.drone_params["mass"] * 9.81, 0.0])
+                self._acados_ocp_solver.set(j, "x", xj_guess)
+                self._acados_ocp_solver.set(j, "u", hover_u)
+            else:
+                # Use the solver's optimized trajectory from the previous tick as the segment guess
+                xj_prev = self._acados_ocp_solver.get(j, "x")
+                theta_pred = float(xj_prev[12])
+
+            # Clip to valid spline bounds
             theta_pred = float(
                 np.clip(theta_pred, self._des_pos_spline.x[0], self._des_pos_spline.x[-1])
             )
@@ -400,25 +431,48 @@ class AttitudeMPC(Controller):
             pos_pred = self._des_pos_spline(theta_pred)
             dist_to_waypoint_j = np.min(np.linalg.norm(self._waypoints_pos - pos_pred, axis=1))
             q_c_j = 10.0 if dist_to_waypoint_j < 0.5 else 1.0
+            theta_offset_j = self._des_pos_spline.x[seg_idx_j]
 
-            params_j = np.zeros((13,))
+            params_j = np.zeros((14,))
             params_j[0:4] = px_j.flatten()
             params_j[4:8] = py_j.flatten()
             params_j[8:12] = pz_j.flatten()
             params_j[12] = q_c_j
+            params_j[13] = theta_offset_j
+
             self._acados_ocp_solver.set(j, "p", params_j)
 
         # Solve and extract first control. We run the RTI solver to meet 50 Hz real-time.
         self._acados_ocp_solver.solve()
+
+        for j in range(self._N):
+            xj = self._acados_ocp_solver.get(j, "x")
+            self._predicted_trajectory[j] = xj[0:3]
+
         u0_aug = self._acados_ocp_solver.get(0, "u")
         x1_opt = self._acados_ocp_solver.get(1, "x")
         self._current_theta = float(x1_opt[12])
         self._current_v_theta = float(x1_opt[13])
 
-        # Strip virtual input a_theta (last entry) and return base control [r,p,y,thrust]
         u0 = u0_aug[0:4]
 
+        # Logging for telemetry debugging
+        self._log_z.append(obs["pos"][2])
+        self._log_target_z.append(float(pos_ref_current[2]))
+        self._log_thrust.append(float(u0[3]))
+
         return u0
+
+    def render_callback(self, sim: Sim):
+        """Visualize the spatial reference path, the current MPCC target, and the predicted horizon."""
+        trajectory = self._des_pos_spline(np.linspace(0.0, self._s_total, 150))
+        draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
+
+        target_pos = self._des_pos_spline(self._current_theta)
+        draw_points(sim, target_pos.reshape(1, -1), rgba=(1.0, 0.0, 0.0, 1.0), size=0.04)
+
+        if self._predicted_trajectory.shape[0] > 0:
+            draw_line(sim, self._predicted_trajectory, rgba=(1.0, 0.5, 0.0, 1.0))
 
     def step_callback(
         self,
@@ -435,5 +489,29 @@ class AttitudeMPC(Controller):
         return self._finished
 
     def episode_callback(self):
-        """Reset the integral error."""
+        """Plot debug telemetry and reset the integral error."""
+        hover_thrust = self.drone_params["mass"] * 9.81
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        ax1.plot(self._log_z, label="Z Position")
+        ax1.plot(self._log_target_z, label="Target Z")
+        ax1.set_ylabel("Altitude [m]")
+        ax1.legend()
+        ax1.grid(True)
+
+        ax2.plot(self._log_thrust, label="Thrust Command")
+        ax2.axhline(hover_thrust, color="r", linestyle="--", label="Hover Thrust")
+        ax2.set_ylabel("Thrust [N]")
+        ax2.set_xlabel("Timestep")
+        ax2.legend()
+        ax2.grid(True)
+
+        fig.tight_layout()
+        fig.savefig("mpcc_telemetry_debug.png")
+        plt.show()
+        plt.close(fig)
+
+        self._log_z.clear()
+        self._log_target_z.clear()
+        self._log_thrust.clear()
         self._tick = 0
