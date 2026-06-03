@@ -134,7 +134,7 @@ def create_ocp_solver(
 
     # Get Dimensions
     nx = ocp.model.x.rows()
-    nu = ocp.model.u.rows()
+    ocp.model.u.rows()
     # For NONLINEAR_LS cost we rely on the model.cost_y_expr size
     ny = int(ocp.model.cost_y_expr.rows())
     # terminal residual
@@ -151,34 +151,6 @@ def create_ocp_solver(
     # Cost Type: use NONLINEAR_LS for MPCC formulation
     ocp.cost.cost_type = "NONLINEAR_LS"
     ocp.cost.cost_type_e = "NONLINEAR_LS"
-
-    # Weights
-    # State weights
-    Q = np.diag(
-        [
-            50.0,  # pos
-            50.0,  # pos
-            400.0,  # pos
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
-            10.0,  # vel
-            10.0,  # vel
-            10.0,  # vel
-            5.0,  # drpy
-            5.0,  # drpy
-            5.0,  # drpy
-        ]
-    )
-    # Input weights (reference is upright orientation and hover thrust)
-    R = np.diag(
-        [
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
-            50.0,  # thrust
-        ]
-    )
 
     W = np.zeros((ny, ny))
     # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
@@ -216,15 +188,15 @@ def create_ocp_solver(
     pos_ref_e = ca.vertcat(ca.dot(px, theta_pows), ca.dot(py, theta_pows), ca.dot(pz, theta_pows))
     ocp.model.cost_y_expr_e = ocp.model.x[0:3] - pos_ref_e
 
-    # Set State Constraints (rpy < 30°)
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5])
-    ocp.constraints.idxbx = np.array([3, 4, 5])
+    # Set State Constraints (roll/pitch/yaw and forward progress velocity)
+    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5, 0.0])
+    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5, 10.0])
+    ocp.constraints.idxbx = np.array([3, 4, 5, 13])
 
-    # Set Input Constraints (rpy < 30°)
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
-    ocp.constraints.idxbu = np.array([0, 1, 2, 3])
+    # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
+    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -10.0])
+    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 10.0])
+    ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
     ocp.constraints.x0 = np.zeros((nx))
@@ -273,6 +245,9 @@ class AttitudeMPC(Controller):
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
+        self._current_theta = 0.0
+        self._current_v_theta = 0.0
+
         # Same waypoints as in the trajectory controller. Determined by trial and error.
         waypoints = np.array(
             [
@@ -288,16 +263,23 @@ class AttitudeMPC(Controller):
                 [0.5, -0.75, 1.2],
             ]
         )
-        self._t_total = 15  # s
-        t = np.linspace(0, self._t_total, len(waypoints))
-        self._des_pos_spline = CubicSpline(t, waypoints)
+
+        # 1. Calculate the Euclidean distance between consecutive waypoints
+        distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+
+        # 2. Create the cumulative chord length array (starts at 0)
+        # s will look something like: [0.0, 0.6, 2.1, 3.4, ...]
+        s = np.concatenate(([0.0], np.cumsum(distances)))
+        self._s_total = s[-1]  # Total physical length of the track
+
+        # 3. Create the arc-length parameterized spline
+        self._des_pos_spline = CubicSpline(s, waypoints)
         self._des_vel_spline = self._des_pos_spline.derivative()
-        self._waypoints_pos = self._des_pos_spline(
-            np.linspace(0, self._t_total, int(config.env.freq * self._t_total))
-        )
-        self._waypoints_vel = self._des_vel_spline(
-            np.linspace(0, self._t_total, int(config.env.freq * self._t_total))
-        )
+
+        # 4. Generate fine evaluation points for the nearest-neighbor search
+        # We now evaluate over the spatial parameter 's' instead of time 't'
+        n_eval_points = 500
+        self._waypoints_pos = self._des_pos_spline(np.linspace(0, self._s_total, n_eval_points))
         self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
@@ -335,7 +317,7 @@ class AttitudeMPC(Controller):
             The orientation as roll, pitch, yaw angles, and the collective thrust
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
-        i = min(self._tick, self._tick_max)
+        min(self._tick, self._tick_max)
         if self._tick >= self._tick_max:
             self._finished = True
 
@@ -350,9 +332,9 @@ class AttitudeMPC(Controller):
         n_segments = len(self._des_pos_spline.x) - 1
         seg_idx = min(max(nearest_idx, 0), max(0, n_segments - 1))
 
-        # Local theta initial guess: simple placeholder (0.0). TODO: replace with proper projection
-        theta0 = 0.0
-        v_theta0 = 0.0
+        # Use persistent virtual progress states instead of resetting them every tick.
+        theta0 = self._current_theta
+        v_theta0 = self._current_v_theta
 
         # Augmented initial state
         x0_aug = np.concatenate((x0, np.array([theta0, v_theta0])))
@@ -397,13 +379,41 @@ class AttitudeMPC(Controller):
         params[8:12] = pz.flatten()
         params[12] = q_c
 
-        # Set the same (or a shifting) segment polynomial across the horizon.
+        # Set spline parameters stage-by-stage using predicted theta.
         for j in range(self._N):
-            self._acados_ocp_solver.set(j, "p", params)
+            theta_pred = self._current_theta + j * self._dt * self._current_v_theta
+            theta_pred = float(
+                np.clip(theta_pred, self._des_pos_spline.x[0], self._des_pos_spline.x[-1])
+            )
+
+            seg_idx_j = int(np.searchsorted(self._des_pos_spline.x[1:], theta_pred, side="right"))
+            seg_idx_j = min(max(seg_idx_j, 0), n_segments - 1)
+            try:
+                c_seg_j = cs_c[:, seg_idx_j, :]
+            except Exception:
+                c_seg_j = cs_c[:, :, seg_idx_j]
+
+            px_j = c_seg_j[:, 0]
+            py_j = c_seg_j[:, 1]
+            pz_j = c_seg_j[:, 2]
+
+            pos_pred = self._des_pos_spline(theta_pred)
+            dist_to_waypoint_j = np.min(np.linalg.norm(self._waypoints_pos - pos_pred, axis=1))
+            q_c_j = 10.0 if dist_to_waypoint_j < 0.5 else 1.0
+
+            params_j = np.zeros((13,))
+            params_j[0:4] = px_j.flatten()
+            params_j[4:8] = py_j.flatten()
+            params_j[8:12] = pz_j.flatten()
+            params_j[12] = q_c_j
+            self._acados_ocp_solver.set(j, "p", params_j)
 
         # Solve and extract first control. We run the RTI solver to meet 50 Hz real-time.
         self._acados_ocp_solver.solve()
         u0_aug = self._acados_ocp_solver.get(0, "u")
+        x1_opt = self._acados_ocp_solver.get(1, "x")
+        self._current_theta = float(x1_opt[12])
+        self._current_v_theta = float(x1_opt[13])
 
         # Strip virtual input a_theta (last entry) and return base control [r,p,y,thrust]
         u0 = u0_aug[0:4]
