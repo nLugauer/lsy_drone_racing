@@ -17,7 +17,7 @@ import numpy as np
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
-from drone_models.so_rpy import symbolic_dynamics_euler
+from drone_models.so_rpy_rotor_drag import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
@@ -32,24 +32,33 @@ if TYPE_CHECKING:
 def create_acados_model(parameters: dict) -> AcadosModel:
     """Creates an acados model from a symbolic drone_model."""
     # Build base symbolic variables (outside the read-only drone-models library)
-    x_base = ca.MX.sym("x_base", 12, 1)
+    x_base = ca.MX.sym("x_base", 13, 1)
     u_base = ca.MX.sym("u_base", 4, 1)
 
     # Call the library helper to get the base dynamics expression
     X_dot_lib, X_lib, U_lib, _ = symbolic_dynamics_euler(
+        model_rotor_vel=True,
         mass=parameters["mass"],
         gravity_vec=parameters["gravity_vec"],
         J=parameters["J"],
         J_inv=parameters["J_inv"],
+        thrust_time_coef=parameters["thrust_time_coef"],
         acc_coef=parameters["acc_coef"],
         cmd_f_coef=parameters["cmd_f_coef"],
         rpy_coef=parameters["rpy_coef"],
         rpy_rates_coef=parameters["rpy_rates_coef"],
         cmd_rpy_coef=parameters["cmd_rpy_coef"],
+        drag_matrix=parameters["drag_matrix"],
     )
 
-    # Substitute library-internal state/input symbols with our x_base / u_base symbols
-    X_dot_base = ca.substitute(X_dot_lib, X_lib, x_base)
+    # Substitute library-internal state/input symbols with our x_base / u_base symbols.
+    # The library defines rotor_vel as a 4-vector, making X_lib size 16.
+    # We pad our 13-element x_base with 3 zeros to match sizes during substitution.
+    X_sub = ca.vertcat(x_base, ca.MX.zeros(3, 1))
+    X_dot_base = ca.substitute(X_dot_lib, X_lib, X_sub)
+
+    # Slice the first 13 elements to extract our 12 base states + the scalar thrust derivative
+    X_dot_base = X_dot_base[0:13]
     X_dot_base = ca.substitute(X_dot_base, U_lib, u_base)
 
     # MPCC augmentation: add virtual progress states theta and v_theta, and virtual input a_theta
@@ -82,8 +91,8 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     q_c = model.p[12]
     theta_offset = model.p[13]
 
-    theta_sym = x_aug[12]
-    v_theta_sym = x_aug[13]
+    theta_sym = x_aug[13]
+    v_theta_sym = x_aug[14]
 
     # Local parameter within the current segment to avoid large absolute powers
     d_theta = theta_sym - theta_offset
@@ -165,8 +174,8 @@ def create_ocp_solver(
         [25.0, 25.0, 25.0]
     )  # The actual weight is driven dynamically by q_c in the model
     W[3, 3] = 400.0  # High constant weight q_l to keep the virtual state tied to reality
-    W[4:8, 4:8] = np.diag([50.0, 50.0, 50.0, 250.0])  # Control regularization R
-    W[8, 8] = 0.65  # Progress weight mu
+    W[4:8, 4:8] = np.diag([50.0, 50.0, 50.0, 200.0])  # Control regularization R
+    W[8, 8] = 0.5  # Progress weight mu
     ocp.cost.W = W
 
     # Terminal weights
@@ -194,11 +203,11 @@ def create_ocp_solver(
     # TODO: revert roll/pitch/yaw limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
     ocp.constraints.lbx = np.array([-1.0, -1.0, -1.0, 0.0])
     ocp.constraints.ubx = np.array([1.0, 1.0, 1.0, 10.0])
-    ocp.constraints.idxbx = np.array([3, 4, 5, 13])
+    ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
     # TODO: revert roll/pitch limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
-    ocp.constraints.lbu = np.array([-1.0, -1.0, -1.0, parameters["thrust_min"] * 4, 0.0001])
+    ocp.constraints.lbu = np.array([-1.0, -1.0, -1.0, parameters["thrust_min"] * 4, 0.01])
     ocp.constraints.ubu = np.array([1.0, 1.0, 1.0, parameters["thrust_max"] * 4, 10.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
@@ -247,7 +256,7 @@ class AttitudeMPC(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
-        self._N = 25
+        self._N = 28
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
@@ -297,7 +306,7 @@ class AttitudeMPC(Controller):
         self._waypoints_pos = self._des_pos_spline(np.linspace(0, self._s_total, n_eval_points))
         self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
 
-        self.drone_params = load_params("so_rpy", config.sim.drone_model)
+        self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params
         )
@@ -316,6 +325,7 @@ class AttitudeMPC(Controller):
         self._tick = 0
         self._config = config
         self._finished = False
+        self._last_thrust = self.drone_params["mass"] * 9.81  # Track thrust state for next tick
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -343,7 +353,7 @@ class AttitudeMPC(Controller):
         # Setting initial state
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
         obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        x0 = np.concatenate((obs["pos"], obs["rpy"], obs["vel"], obs["drpy"]))
+        x0 = np.concatenate((obs["pos"], obs["rpy"], obs["vel"], obs["drpy"], [self._last_thrust]))
 
         # Estimate current progress along the spline by nearest waypoint index
         nearest_idx = int(np.argmin(np.linalg.norm(self._waypoints_pos - obs["pos"], axis=1)))
@@ -355,7 +365,7 @@ class AttitudeMPC(Controller):
         theta0 = self._current_theta
         v_theta0 = self._current_v_theta
 
-        # Augmented initial state
+        # Augmented initial state: [pos(3), rpy(3), vel(3), drpy(3), rotor_vel(1), theta(1), v_theta(1)]
         x0_aug = np.concatenate((x0, np.array([theta0, v_theta0])))
         self._acados_ocp_solver.set(0, "lbx", x0_aug)
         self._acados_ocp_solver.set(0, "ubx", x0_aug)
@@ -409,15 +419,15 @@ class AttitudeMPC(Controller):
                     self._current_theta + j * self._dt * 2.0
                 )  # Assume 2.0 m/s initial progress
                 xj_guess = x0_aug.copy()
-                xj_guess[12] = theta_pred
-                xj_guess[13] = 2.0
+                xj_guess[13] = theta_pred
+                xj_guess[14] = 2.0
                 hover_u = np.array([0.0, 0.0, 0.0, self.drone_params["mass"] * 9.81, 0.0])
                 self._acados_ocp_solver.set(j, "x", xj_guess)
                 self._acados_ocp_solver.set(j, "u", hover_u)
             else:
                 # Use the solver's optimized trajectory from the previous tick as the segment guess
                 xj_prev = self._acados_ocp_solver.get(j, "x")
-                theta_pred = float(xj_prev[12])
+                theta_pred = float(xj_prev[13])
 
             # Clip to valid spline bounds
             theta_pred = float(
@@ -467,10 +477,11 @@ class AttitudeMPC(Controller):
 
         u0_aug = self._acados_ocp_solver.get(0, "u")
         x1_opt = self._acados_ocp_solver.get(1, "x")
-        self._current_theta = float(x1_opt[12])
-        self._current_v_theta = float(x1_opt[13])
+        self._current_theta = float(x1_opt[13])
+        self._current_v_theta = float(x1_opt[14])
 
         u0 = u0_aug[0:4]
+        self._last_thrust = float(u0[3])  # Save thrust command for next tick
 
         # Calculate Contour and Lag Error for Telemetry
         p_curr = obs["pos"]
@@ -501,6 +512,7 @@ class AttitudeMPC(Controller):
         self._log_v_theta.append(self._current_v_theta)
         self._log_q_c.append(float(q_c_current))
 
+        self._tick += 1
         return u0
 
     def render_callback(self, sim: Sim):
