@@ -10,6 +10,7 @@ Look for instructions in `README.md` and in the official documentation.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -95,6 +96,7 @@ def simulate(
                 if ((i * fps) % config.env.freq) < fps:
                     controller.render_callback(env.unwrapped.sim)
                     env.render()
+                    time.sleep(1.0 / fps)
             i += 1
 
         controller.episode_callback()  # Update the controller internal state and models.

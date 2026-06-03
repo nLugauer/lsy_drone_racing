@@ -74,13 +74,14 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.f_expl_expr = x_dot_aug
     model.f_impl_expr = None
 
-    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c + 1 local offset)
-    model.p = ca.MX.sym("p", 14)
+    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c + 1 local offset + 8 obstacle XY coords)
+    model.p = ca.MX.sym("p", 22)
     px = model.p[0:4]
     py = model.p[4:8]
     pz = model.p[8:12]
     q_c = model.p[12]
     theta_offset = model.p[13]
+    obs_xy_flat = model.p[14:22]
 
     theta_sym = x_aug[12]
     v_theta_sym = x_aug[13]
@@ -121,11 +122,22 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     # we multiply the vector by sqrt(q_c) so that squaring it yields q_c * ||e^c||^2
     weighted_e_cont = ca.sqrt(q_c) * e_cont_vec
 
-    # Final cost_y_expr. Size: 3 (Contour) + 1 (Lag) + 4 (u_base) + 1 (v_theta) = 9
-    model.cost_y_expr = ca.vertcat(weighted_e_cont, e_lag_scalar, u_aug[0:4], v_theta_sym)
+    # Obstacle repulsion penalty from cylindrical obstacle XY positions.
+    pos_xy = x_aug[0:2]
+    obs_penalty = ca.MX(0.0)
+    for i in range(4):
+        # Extract the 2x1 column vector for obstacle i directly from the flat array
+        obs_i = obs_xy_flat[i * 2 : i * 2 + 2]
+        dist_sq_obs = ca.sumsqr(pos_xy - obs_i)
+        obs_penalty += 5.0 * ca.exp(-dist_sq_obs / 0.05)
 
-    # Terminal cost expression (Size 4: Contour + Lag)
-    model.cost_y_expr_e = ca.vertcat(weighted_e_cont, e_lag_scalar)
+    # Final cost_y_expr. Size: 3 (Contour) + 1 (Lag) + 4 (u_base) + 1 (v_theta) + 1 (obstacle) = 10
+    model.cost_y_expr = ca.vertcat(
+        weighted_e_cont, e_lag_scalar, u_aug[0:4], v_theta_sym, obs_penalty
+    )
+
+    # Terminal cost expression (Size 4: Contour + Lag + obstacle)
+    model.cost_y_expr_e = ca.vertcat(weighted_e_cont, e_lag_scalar, obs_penalty)
 
     return model
 
@@ -160,19 +172,21 @@ def create_ocp_solver(
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
     W = np.zeros((ny, ny))
-    # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
+    # Weights: [Contour(3), Lag(1), Controls(4), Progress(1), Obstacle(1)]
     W[0:3, 0:3] = np.diag(
         [50.0, 50.0, 400.0]
     )  # The actual weight is driven dynamically by q_c in the model
     W[3, 3] = 400.0  # High constant weight q_l to keep the virtual state tied to reality
     W[4:8, 4:8] = np.diag([1.0, 1.0, 1.0, 50.0])  # Control regularization R
-    W[8, 8] = 50.0  # Progress weight mu
+    W[8, 8] = 5.0  # Progress weight mu
+    W[9, 9] = 500.0  # Obstacle repulsion penalty
     ocp.cost.W = W
 
     # Terminal weights
     W_e = np.zeros((ny_e, ny_e))
     W_e[0:3, 0:3] = np.diag([50.0, 50.0, 400.0])  # Terminal contour
     W_e[3, 3] = 400.0  # Terminal lag
+    W_e[4, 4] = 500.0  # Terminal obstacle repulsion
     ocp.cost.W_e = W_e
 
     # Set initial references.
@@ -216,7 +230,7 @@ def create_ocp_solver(
     ocp.solver_options.qp_solver_iter_max = 20
     ocp.solver_options.nlp_solver_max_iter = 50
 
-    ocp.parameter_values = np.zeros((14,))
+    ocp.parameter_values = np.zeros((22,))
 
     # set prediction horizon
     ocp.solver_options.tf = Tf
@@ -252,9 +266,13 @@ class AttitudeMPC(Controller):
         self._current_theta = 0.0
         self._current_v_theta = 0.0
         self._predicted_trajectory = np.zeros((self._N, 3))
-        self._log_z = []
-        self._log_target_z = []
         self._log_thrust = []
+        self._log_roll = []
+        self._log_pitch = []
+        self._log_contour = []
+        self._log_lag = []
+        self._log_v_theta = []
+        self._gate_positions = np.array([g["pos"] for g in config.env.track.gates])
 
         # Same waypoints as in the trajectory controller. Determined by trial and error.
         waypoints = np.array(
@@ -362,7 +380,7 @@ class AttitudeMPC(Controller):
         yref_e_zero = np.zeros((self._ny_e,))
         self._acados_ocp_solver.set(self._N, "y_ref", yref_e_zero)
 
-        # current reference Z at the current virtual progress.
+        # current reference at the current virtual progress.
         pos_ref_current = self._des_pos_spline(self._current_theta)
 
         # Prepare and set parameter vector p for each stage (polynomial coeffs + contour weight)
@@ -382,12 +400,14 @@ class AttitudeMPC(Controller):
         py = c_seg[:, 1]
         pz = c_seg[:, 2]
 
+        # Track obstacle positions and dynamic contouring weight coefficients.
+        obs_positions = np.array([o["pos"][:2] for o in self._config.env.track.obstacles])
+
         # Dynamic contouring weight (placeholder heuristic)
-        # Increase weight when close to a waypoint/gate (simple proximity test)
         dist_to_waypoint = np.linalg.norm(self._waypoints_pos[nearest_idx] - obs["pos"])
         q_c = 10.0 if dist_to_waypoint < 0.5 else 1.0
 
-        params = np.zeros((14,))
+        params = np.zeros((22,))
         params[0:4] = px.flatten()
         params[4:8] = py.flatten()
         params[8:12] = pz.flatten()
@@ -429,16 +449,26 @@ class AttitudeMPC(Controller):
             pz_j = c_seg_j[:, 2]
 
             pos_pred = self._des_pos_spline(theta_pred)
-            dist_to_waypoint_j = np.min(np.linalg.norm(self._waypoints_pos - pos_pred, axis=1))
-            q_c_j = 10.0 if dist_to_waypoint_j < 0.5 else 1.0
+
+            # Gaussian Dynamic Contouring Weight
+            q_nom = 1.0
+            q_wp = 400.0  # Peak weight at the gate
+            sigma_sq = 0.5**2  # Variance
+
+            q_c_j = q_nom
+            for gate_pos in self._gate_positions:
+                dist_sq = np.sum((pos_pred - gate_pos) ** 2)
+                q_c_j += q_wp * np.exp(-0.5 * dist_sq / sigma_sq)
+
             theta_offset_j = self._des_pos_spline.x[seg_idx_j]
 
-            params_j = np.zeros((14,))
+            params_j = np.zeros((22,))
             params_j[0:4] = px_j.flatten()
             params_j[4:8] = py_j.flatten()
             params_j[8:12] = pz_j.flatten()
             params_j[12] = q_c_j
             params_j[13] = theta_offset_j
+            params_j[14:22] = obs_positions.flatten()
 
             self._acados_ocp_solver.set(j, "p", params_j)
 
@@ -456,10 +486,24 @@ class AttitudeMPC(Controller):
 
         u0 = u0_aug[0:4]
 
-        # Logging for telemetry debugging
-        self._log_z.append(obs["pos"][2])
-        self._log_target_z.append(float(pos_ref_current[2]))
+        # Calculate Contour and Lag Error for Telemetry
+        p_curr = obs["pos"]
+        p_ref = self._des_pos_spline(self._current_theta)
+        t_ref = self._des_vel_spline(self._current_theta)
+        t_norm = t_ref / (np.linalg.norm(t_ref) + 1e-6)
+
+        e_pos = p_curr - p_ref
+        e_lag_val = np.dot(e_pos, t_norm)
+        e_cont_vec = e_pos - e_lag_val * t_norm
+        e_cont_val = np.linalg.norm(e_cont_vec)
+
+        # Append to logs
         self._log_thrust.append(float(u0[3]))
+        self._log_roll.append(float(u0[0]))
+        self._log_pitch.append(float(u0[1]))
+        self._log_contour.append(float(e_cont_val))
+        self._log_lag.append(float(e_lag_val))
+        self._log_v_theta.append(self._current_v_theta)
 
         return u0
 
@@ -489,29 +533,55 @@ class AttitudeMPC(Controller):
         return self._finished
 
     def episode_callback(self):
-        """Plot debug telemetry and reset the integral error."""
+        """Plot MPCC telemetry metrics and reset the integral error."""
         hover_thrust = self.drone_params["mass"] * 9.81
+        max_thrust = self.drone_params["thrust_max"] * 4
+        min_thrust = self.drone_params["thrust_min"] * 4
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-        ax1.plot(self._log_z, label="Z Position")
-        ax1.plot(self._log_target_z, label="Target Z")
-        ax1.set_ylabel("Altitude [m]")
-        ax1.legend()
-        ax1.grid(True)
+        fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 
-        ax2.plot(self._log_thrust, label="Thrust Command")
-        ax2.axhline(hover_thrust, color="r", linestyle="--", label="Hover Thrust")
-        ax2.set_ylabel("Thrust [N]")
-        ax2.set_xlabel("Timestep")
-        ax2.legend()
-        ax2.grid(True)
+        # 1. Tracking Errors
+        axs[0].plot(self._log_contour, label="Contour Error (e_c)")
+        axs[0].plot(self._log_lag, label="Lag Error (e_l)")
+        axs[0].set_ylabel("Error [m]")
+        axs[0].legend()
+        axs[0].grid(True)
+
+        # 2. Attitude Commands
+        axs[1].plot(self._log_roll, label="Roll Command")
+        axs[1].plot(self._log_pitch, label="Pitch Command")
+        axs[1].axhline(0.5, color="r", linestyle="--", label="Upper Limit")
+        axs[1].axhline(-0.5, color="r", linestyle="--", label="Lower Limit")
+        axs[1].set_ylabel("Angle [rad]")
+        axs[1].legend()
+        axs[1].grid(True)
+
+        # 3. Thrust Command
+        axs[2].plot(self._log_thrust, label="Thrust Command")
+        axs[2].axhline(hover_thrust, color="g", linestyle=":", label="Hover")
+        axs[2].axhline(max_thrust, color="r", linestyle="--", label="Max Thrust")
+        axs[2].axhline(min_thrust, color="r", linestyle="--", label="Min Thrust")
+        axs[2].set_ylabel("Thrust [N]")
+        axs[2].legend()
+        axs[2].grid(True)
+
+        # 4. Progress Speed
+        axs[3].plot(self._log_v_theta, label="Virtual Speed (v_theta)")
+        axs[3].axhline(15.0, color="g", linestyle="--", label="Target Speed")
+        axs[3].set_ylabel("Speed [m/s]")
+        axs[3].set_xlabel("Timestep")
+        axs[3].legend()
+        axs[3].grid(True)
 
         fig.tight_layout()
-        fig.savefig("mpcc_telemetry_debug.png")
+        fig.savefig("mpcc_standard_metrics.png")
         plt.show()
         plt.close(fig)
 
-        self._log_z.clear()
-        self._log_target_z.clear()
         self._log_thrust.clear()
+        self._log_roll.clear()
+        self._log_pitch.clear()
+        self._log_contour.clear()
+        self._log_lag.clear()
+        self._log_v_theta.clear()
         self._tick = 0
