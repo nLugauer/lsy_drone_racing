@@ -166,7 +166,7 @@ def create_ocp_solver(
     )  # The actual weight is driven dynamically by q_c in the model
     W[3, 3] = 400.0  # High constant weight q_l to keep the virtual state tied to reality
     W[4:8, 4:8] = np.diag([50.0, 50.0, 50.0, 250.0])  # Control regularization R
-    W[8, 8] = 0.25  # Progress weight mu
+    W[8, 8] = 0.65  # Progress weight mu
     ocp.cost.W = W
 
     # Terminal weights
@@ -191,13 +191,15 @@ def create_ocp_solver(
     ocp.model.cost_y_expr_e = ocp.model.cost_y_expr_e
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5, 0.0])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5, 10.0])
+    # TODO: revert roll/pitch/yaw limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
+    ocp.constraints.lbx = np.array([-1.0, -1.0, -1.0, 0.0])
+    ocp.constraints.ubx = np.array([1.0, 1.0, 1.0, 10.0])
     ocp.constraints.idxbx = np.array([3, 4, 5, 13])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, 0.0001])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 10.0])
+    # TODO: revert roll/pitch limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
+    ocp.constraints.lbu = np.array([-1.0, -1.0, -1.0, parameters["thrust_min"] * 4, 0.0001])
+    ocp.constraints.ubu = np.array([1.0, 1.0, 1.0, parameters["thrust_max"] * 4, 10.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -258,6 +260,7 @@ class AttitudeMPC(Controller):
         self._log_contour = []
         self._log_lag = []
         self._log_v_theta = []
+        self._log_q_c = []
         self._gate_positions = np.array([g["pos"] for g in config.env.track.gates])
 
         # Same waypoints as in the trajectory controller. Determined by trial and error.
@@ -436,8 +439,8 @@ class AttitudeMPC(Controller):
 
             # Gaussian Dynamic Contouring Weight
             q_nom = 1.0
-            q_wp = 400.0  # Peak weight at the gate
-            sigma_sq = 0.5**2  # Variance
+            q_wp = 300.0  # Peak weight at the gate
+            sigma_sq = 0.4**2  # Variance
 
             q_c_j = q_nom
             for gate_pos in self._gate_positions:
@@ -480,6 +483,15 @@ class AttitudeMPC(Controller):
         e_cont_vec = e_pos - e_lag_val * t_norm
         e_cont_val = np.linalg.norm(e_cont_vec)
 
+        # Calculate current dynamic contour weight
+        q_nom = 1.0
+        q_wp = 300.0
+        sigma_sq = 0.4**2
+        q_c_current = q_nom
+        for gate_pos in self._gate_positions:
+            dist_sq = np.sum((p_ref - gate_pos) ** 2)
+            q_c_current += q_wp * np.exp(-0.5 * dist_sq / sigma_sq)
+
         # Append to logs
         self._log_thrust.append(float(u0[3]))
         self._log_roll.append(float(u0[0]))
@@ -487,6 +499,7 @@ class AttitudeMPC(Controller):
         self._log_contour.append(float(e_cont_val))
         self._log_lag.append(float(e_lag_val))
         self._log_v_theta.append(self._current_v_theta)
+        self._log_q_c.append(float(q_c_current))
 
         return u0
 
@@ -521,7 +534,7 @@ class AttitudeMPC(Controller):
         max_thrust = self.drone_params["thrust_max"] * 4
         min_thrust = self.drone_params["thrust_min"] * 4
 
-        fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+        fig, axs = plt.subplots(5, 1, figsize=(10, 15), sharex=True)
 
         # 1. Tracking Errors
         axs[0].plot(self._log_contour, label="Contour Error (e_c)")
@@ -552,9 +565,15 @@ class AttitudeMPC(Controller):
         axs[3].plot(self._log_v_theta, label="Virtual Speed (v_theta)")
         axs[3].axhline(15.0, color="g", linestyle="--", label="Target Speed")
         axs[3].set_ylabel("Speed [m/s]")
-        axs[3].set_xlabel("Timestep")
         axs[3].legend()
         axs[3].grid(True)
+
+        # 5. Dynamic Contour Weight
+        axs[4].plot(self._log_q_c, label="Contour Weight (q_c)", color="purple")
+        axs[4].set_ylabel("Weight")
+        axs[4].set_xlabel("Timestep")
+        axs[4].legend()
+        axs[4].grid(True)
 
         fig.tight_layout()
         fig.savefig("mpcc_standard_metrics.png")
@@ -567,4 +586,5 @@ class AttitudeMPC(Controller):
         self._log_contour.clear()
         self._log_lag.clear()
         self._log_v_theta.clear()
+        self._log_q_c.clear()
         self._tick = 0
