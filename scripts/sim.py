@@ -69,6 +69,7 @@ def simulate(
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
         seed=config.env.seed,
+        max_episode_steps=5000,
     )
     env = JaxToNumpy(env)
 

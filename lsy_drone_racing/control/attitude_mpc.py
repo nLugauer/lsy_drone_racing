@@ -74,14 +74,13 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.f_expl_expr = x_dot_aug
     model.f_impl_expr = None
 
-    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c + 1 local offset + 8 obstacle XY coords)
-    model.p = ca.MX.sym("p", 22)
+    # model parameter vector p (12 spline coeffs + 1 contouring weight q_c + 1 local offset)
+    model.p = ca.MX.sym("p", 14)
     px = model.p[0:4]
     py = model.p[4:8]
     pz = model.p[8:12]
     q_c = model.p[12]
     theta_offset = model.p[13]
-    obs_xy_flat = model.p[14:22]
 
     theta_sym = x_aug[12]
     v_theta_sym = x_aug[13]
@@ -122,22 +121,11 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     # we multiply the vector by sqrt(q_c) so that squaring it yields q_c * ||e^c||^2
     weighted_e_cont = ca.sqrt(q_c) * e_cont_vec
 
-    # Obstacle repulsion penalty from cylindrical obstacle XY positions.
-    pos_xy = x_aug[0:2]
-    obs_penalty = ca.MX(0.0)
-    for i in range(4):
-        # Extract the 2x1 column vector for obstacle i directly from the flat array
-        obs_i = obs_xy_flat[i * 2 : i * 2 + 2]
-        dist_sq_obs = ca.sumsqr(pos_xy - obs_i)
-        obs_penalty += 5.0 * ca.exp(-dist_sq_obs / 0.05)
+    # Final cost_y_expr. Size: 3 (Contour) + 1 (Lag) + 4 (u_base) + 1 (v_theta) = 9
+    model.cost_y_expr = ca.vertcat(weighted_e_cont, e_lag_scalar, u_aug[0:4], v_theta_sym)
 
-    # Final cost_y_expr. Size: 3 (Contour) + 1 (Lag) + 4 (u_base) + 1 (v_theta) + 1 (obstacle) = 10
-    model.cost_y_expr = ca.vertcat(
-        weighted_e_cont, e_lag_scalar, u_aug[0:4], v_theta_sym, obs_penalty
-    )
-
-    # Terminal cost expression (Size 4: Contour + Lag + obstacle)
-    model.cost_y_expr_e = ca.vertcat(weighted_e_cont, e_lag_scalar, obs_penalty)
+    # Terminal cost expression (Size 4: Contour + Lag)
+    model.cost_y_expr_e = ca.vertcat(weighted_e_cont, e_lag_scalar)
 
     return model
 
@@ -172,21 +160,19 @@ def create_ocp_solver(
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
     W = np.zeros((ny, ny))
-    # Weights: [Contour(3), Lag(1), Controls(4), Progress(1), Obstacle(1)]
+    # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
     W[0:3, 0:3] = np.diag(
-        [50.0, 50.0, 400.0]
+        [25.0, 25.0, 25.0]
     )  # The actual weight is driven dynamically by q_c in the model
     W[3, 3] = 400.0  # High constant weight q_l to keep the virtual state tied to reality
-    W[4:8, 4:8] = np.diag([1.0, 1.0, 1.0, 50.0])  # Control regularization R
-    W[8, 8] = 5.0  # Progress weight mu
-    W[9, 9] = 500.0  # Obstacle repulsion penalty
+    W[4:8, 4:8] = np.diag([50.0, 50.0, 50.0, 250.0])  # Control regularization R
+    W[8, 8] = 0.25  # Progress weight mu
     ocp.cost.W = W
 
     # Terminal weights
     W_e = np.zeros((ny_e, ny_e))
-    W_e[0:3, 0:3] = np.diag([50.0, 50.0, 400.0])  # Terminal contour
+    W_e[0:3, 0:3] = np.diag([50.0, 50.0, 50.0])  # Terminal contour
     W_e[3, 3] = 400.0  # Terminal lag
-    W_e[4, 4] = 500.0  # Terminal obstacle repulsion
     ocp.cost.W_e = W_e
 
     # Set initial references.
@@ -230,7 +216,7 @@ def create_ocp_solver(
     ocp.solver_options.qp_solver_iter_max = 20
     ocp.solver_options.nlp_solver_max_iter = 50
 
-    ocp.parameter_values = np.zeros((22,))
+    ocp.parameter_values = np.zeros((14,))
 
     # set prediction horizon
     ocp.solver_options.tf = Tf
@@ -325,7 +311,6 @@ class AttitudeMPC(Controller):
             self._ny_e = int(3)
 
         self._tick = 0
-        self._tick_max = len(self._waypoints_pos) - 1 - self._N
         self._config = config
         self._finished = False
 
@@ -343,8 +328,13 @@ class AttitudeMPC(Controller):
             The orientation as roll, pitch, yaw angles, and the collective thrust
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
-        min(self._tick, self._tick_max)
-        if self._tick >= self._tick_max:
+        # Define the terminal condition:
+        # 1. Virtual progress must be near the end.
+        # 2. Physical drone must be near the final waypoint.
+        final_waypoint = self._des_pos_spline(self._s_total)
+        dist_to_final = np.linalg.norm(obs["pos"] - final_waypoint)
+
+        if self._current_theta >= self._s_total - 0.5 and dist_to_final < 0.5:
             self._finished = True
 
         # Setting initial state
@@ -380,9 +370,6 @@ class AttitudeMPC(Controller):
         yref_e_zero = np.zeros((self._ny_e,))
         self._acados_ocp_solver.set(self._N, "y_ref", yref_e_zero)
 
-        # current reference at the current virtual progress.
-        pos_ref_current = self._des_pos_spline(self._current_theta)
-
         # Prepare and set parameter vector p for each stage (polynomial coeffs + contour weight)
         # Extract cubic coefficients for the current segment from the CubicSpline object
         # SciPy CubicSpline stores coefficients in `.c` with shape (4, n_segments, dim)
@@ -400,14 +387,11 @@ class AttitudeMPC(Controller):
         py = c_seg[:, 1]
         pz = c_seg[:, 2]
 
-        # Track obstacle positions and dynamic contouring weight coefficients.
-        obs_positions = np.array([o["pos"][:2] for o in self._config.env.track.obstacles])
-
         # Dynamic contouring weight (placeholder heuristic)
         dist_to_waypoint = np.linalg.norm(self._waypoints_pos[nearest_idx] - obs["pos"])
         q_c = 10.0 if dist_to_waypoint < 0.5 else 1.0
 
-        params = np.zeros((22,))
+        params = np.zeros((14,))
         params[0:4] = px.flatten()
         params[4:8] = py.flatten()
         params[8:12] = pz.flatten()
@@ -462,13 +446,12 @@ class AttitudeMPC(Controller):
 
             theta_offset_j = self._des_pos_spline.x[seg_idx_j]
 
-            params_j = np.zeros((22,))
+            params_j = np.zeros((14,))
             params_j[0:4] = px_j.flatten()
             params_j[4:8] = py_j.flatten()
             params_j[8:12] = pz_j.flatten()
             params_j[12] = q_c_j
             params_j[13] = theta_offset_j
-            params_j[14:22] = obs_positions.flatten()
 
             self._acados_ocp_solver.set(j, "p", params_j)
 
@@ -508,7 +491,7 @@ class AttitudeMPC(Controller):
         return u0
 
     def render_callback(self, sim: Sim):
-        """Visualize the spatial reference path, the current MPCC target, and the predicted horizon."""
+        """Visualize the reference path, the current MPCC target, and the predicted horizon."""
         trajectory = self._des_pos_spline(np.linspace(0.0, self._s_total, 150))
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
 
