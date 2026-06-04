@@ -78,7 +78,7 @@ def simulate(
         obs, info = env.reset()
         controller: Controller = controller_cls(obs, info, config)
         i = 0
-        fps = 60
+        fps = 6000
 
         while True:
             curr_time = i / config.env.freq

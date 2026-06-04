@@ -13,15 +13,16 @@ from scipy.interpolate import CubicSpline
 class TrajectoryPlanner:
     """Encapsulates path generation and spline evaluation for MPC."""
 
-    def __init__(self, waypoints: np.ndarray | None = None, n_eval_points: int = 500) -> None:
-        """Build the spline from waypoints and prepare nearest-neighbor data.
-
-        Args:
-            waypoints: (N, 3) array of intermediate waypoints [x, y, z].
-                      If None, uses default reference track waypoints.
-            n_eval_points: Number of points for fine-grained spline sampling.
-        """
-        if waypoints is None:
+    def __init__(
+        self,
+        start_pos: np.ndarray | None = None,
+        gates_pos: np.ndarray | None = None,
+        n_eval_points: int = 500,
+        min_z: float = 0.15,
+    ) -> None:
+        """Build the spline from start pos + gates, ensuring ground clearance."""
+        # 1. Handle fallback to hardcoded waypoints if gates_pos is None
+        if gates_pos is None:
             waypoints = np.array(
                 [
                     [-1.5, 0.75, 0.05],
@@ -36,22 +37,46 @@ class TrajectoryPlanner:
                     [0.5, -0.75, 1.2],
                 ]
             )
+            if start_pos is not None:
+                waypoints = np.vstack((start_pos, waypoints))
         else:
-            waypoints = np.asarray(waypoints, dtype=np.float64)
+            waypoints = np.vstack((start_pos, gates_pos))
 
-        # 1. Calculate the Euclidean distance between consecutive waypoints
-        distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
-
-        # 2. Create the cumulative chord length array (starts at 0)
-        self._s = np.concatenate(([0.0], np.cumsum(distances)))
+        # 2. Build the spline with ground-clearance checks
+        self._s, self._des_pos_spline = self._build_safe_spline(waypoints, min_z)
         self._s_total = float(self._s[-1])
 
-        # 3. Create the arc-length parameterized spline
-        self._des_pos_spline = CubicSpline(self._s, waypoints)
+        # 3. Precompute derivatives and fine evaluation points
         self._des_vel_spline = self._des_pos_spline.derivative()
-
-        # 4. Generate fine evaluation points for the nearest-neighbor search
         self._waypoints_pos = self._des_pos_spline(np.linspace(0, self._s_total, n_eval_points))
+
+    def _build_safe_spline(
+        self, waypoints: np.ndarray, min_z: float
+    ) -> tuple[np.ndarray, CubicSpline]:
+        """Pre-emptively injects safe midpoints between all waypoints to prevent floor dips."""
+        safe_waypoints = [waypoints[0]]
+
+        for i in range(len(waypoints) - 1):
+            p1 = waypoints[i]
+            p2 = waypoints[i + 1]
+
+            # Calculate exact geometric midpoint
+            midpoint = (p1 + p2) / 2.0
+
+            # Clamp the Z coordinate to ensure it never drops below the safety margin
+            midpoint[2] = max(midpoint[2], min_z)
+
+            safe_waypoints.append(midpoint)
+            safe_waypoints.append(p2)
+
+        safe_wpts_arr = np.array(safe_waypoints)
+
+        # Calculate standard chord lengths for the newly augmented waypoints
+        distances = np.linalg.norm(np.diff(safe_wpts_arr, axis=0), axis=1)
+        s = np.concatenate(([0.0], np.cumsum(distances)))
+        spline = CubicSpline(s, safe_wpts_arr)
+
+        return s, spline
 
     @property
     def total_length(self) -> float:

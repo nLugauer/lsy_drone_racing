@@ -1,12 +1,18 @@
-1. Clean up the code
+1. [x] Clean up the code
     * make different classes
-    * split up functionallies
+    * split up functionalities
 
-2. Implement Obstacles
-   * Model Obstacles fast math expression
-     * Gates
-     * Poles
-   * Approach 1: fast online replanning (Qianhao Wang et al.)
-     * Uses MINCO Polynomial for trajectory replanning
+2. [ ] Implement Obstacles
+   * Improve Obstacle model from cylinder to smth. continuous
+   
+3. [ ] Implement Track online replanning:
+   * minimal snap
+   * MINCO
+   * > 20ms max for 50Hz
 
-   * Approach 2: Purely rely on prediction Horizon of MPC with soft Const 
+4. [ ] Robustness
+   * Tube MPC: Radius of uncertainty + Perception has to be the Terminal / Feasible Set
+   * make some literature research about that
+   * come up with expression and proof
+   * Downside: could be to conservative...
+     * -> is there a thin like stochastic feasible sets for tuning conservatism with aggressiveness? 

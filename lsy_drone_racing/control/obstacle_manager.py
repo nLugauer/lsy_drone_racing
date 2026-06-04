@@ -31,8 +31,8 @@ class ObstacleManager:
         self._gate_obstacle_indices = []
         self._pole_obstacle_indices = []
         self._q_nom = 1.0
-        self._q_wp = 300.0
-        self._sigma_sq = 0.4**2
+        self._q_wp = 150.0
+        self._sigma_sq = 0.25**2
 
     def add_sphere(self, center: np.ndarray, radius: float) -> None:
         """Add a spherical obstacle.
@@ -149,7 +149,8 @@ class ObstacleManager:
                 pos_val = [pos["x"], pos["y"], pos["z"]]
             else:
                 raise TypeError(
-                    "Unsupported dict format for pole position; expected keys 'pos', 'position' or 'x','y','z'"
+                    "Unsupported dict format for pole position; "
+                    "expected keys 'pos', 'position' or 'x','y','z'"
                 )
         else:
             pos_val = pos
