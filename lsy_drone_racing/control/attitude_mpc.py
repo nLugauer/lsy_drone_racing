@@ -19,10 +19,11 @@ from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.so_rpy_rotor_drag import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
-from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.obstacle_manager import ObstacleManager
+from lsy_drone_racing.control.trajectory_planner import TrajectoryPlanner
 
 if TYPE_CHECKING:
     from crazyflow import Sim
@@ -150,7 +151,6 @@ def create_ocp_solver(
 
     # Get Dimensions
     nx = ocp.model.x.rows()
-    ocp.model.u.rows()
     # For NONLINEAR_LS cost we rely on the model.cost_y_expr size
     ny = int(ocp.model.cost_y_expr.rows())
     # terminal residual
@@ -270,41 +270,11 @@ class AttitudeMPC(Controller):
         self._log_lag = []
         self._log_v_theta = []
         self._log_q_c = []
-        self._gate_positions = np.array([g["pos"] for g in config.env.track.gates])
 
-        # Same waypoints as in the trajectory controller. Determined by trial and error.
-        waypoints = np.array(
-            [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
+        self._trajectory = TrajectoryPlanner()
+        self._obstacle_manager = ObstacleManager(
+            np.array([g["pos"] for g in config.env.track.gates])
         )
-
-        # 1. Calculate the Euclidean distance between consecutive waypoints
-        distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
-
-        # 2. Create the cumulative chord length array (starts at 0)
-        # s will look something like: [0.0, 0.6, 2.1, 3.4, ...]
-        s = np.concatenate(([0.0], np.cumsum(distances)))
-        self._s_total = s[-1]  # Total physical length of the track
-
-        # 3. Create the arc-length parameterized spline
-        self._des_pos_spline = CubicSpline(s, waypoints)
-        self._des_vel_spline = self._des_pos_spline.derivative()
-
-        # 4. Generate fine evaluation points for the nearest-neighbor search
-        # We now evaluate over the spatial parameter 's' instead of time 't'
-        n_eval_points = 500
-        self._waypoints_pos = self._des_pos_spline(np.linspace(0, self._s_total, n_eval_points))
-        self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
 
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
@@ -344,10 +314,10 @@ class AttitudeMPC(Controller):
         # Define the terminal condition:
         # 1. Virtual progress must be near the end.
         # 2. Physical drone must be near the final waypoint.
-        final_waypoint = self._des_pos_spline(self._s_total)
+        final_waypoint = self._trajectory.final_waypoint()
         dist_to_final = np.linalg.norm(obs["pos"] - final_waypoint)
 
-        if self._current_theta >= self._s_total - 0.5 and dist_to_final < 0.5:
+        if self._current_theta >= self._trajectory.total_length - 0.5 and dist_to_final < 0.5:
             self._finished = True
 
         # Setting initial state
@@ -356,16 +326,14 @@ class AttitudeMPC(Controller):
         x0 = np.concatenate((obs["pos"], obs["rpy"], obs["vel"], obs["drpy"], [self._last_thrust]))
 
         # Estimate current progress along the spline by nearest waypoint index
-        nearest_idx = int(np.argmin(np.linalg.norm(self._waypoints_pos - obs["pos"], axis=1)))
-        # Choose segment where the drone currently is (clamp)
-        n_segments = len(self._des_pos_spline.x) - 1
-        seg_idx = min(max(nearest_idx, 0), max(0, n_segments - 1))
+        nearest_idx = self._trajectory.get_nearest_waypoint_index(obs["pos"])
+        seg_idx = self._trajectory.get_segment_index(nearest_idx)
 
         # Use persistent virtual progress states instead of resetting them every tick.
         theta0 = self._current_theta
         v_theta0 = self._current_v_theta
 
-        # Augmented initial state: [pos(3), rpy(3), vel(3), drpy(3), rotor_vel(1), theta(1), v_theta(1)]
+        # Augmented state has physical states, rotor velocity, and two virtual progress states.
         x0_aug = np.concatenate((x0, np.array([theta0, v_theta0])))
         self._acados_ocp_solver.set(0, "lbx", x0_aug)
         self._acados_ocp_solver.set(0, "ubx", x0_aug)
@@ -383,41 +351,11 @@ class AttitudeMPC(Controller):
         yref_e_zero = np.zeros((self._ny_e,))
         self._acados_ocp_solver.set(self._N, "y_ref", yref_e_zero)
 
-        # Prepare and set parameter vector p for each stage (polynomial coeffs + contour weight)
-        # Extract cubic coefficients for the current segment from the CubicSpline object
-        # SciPy CubicSpline stores coefficients in `.c` with shape (4, n_segments, dim)
-        cs_c = self._des_pos_spline.c
-        # Ensure indexing works for vector-valued spline
-        # c_seg shape expected (4, dim)
-        try:
-            c_seg = cs_c[:, seg_idx, :]
-        except Exception:
-            # fallback if shape differs
-            c_seg = cs_c[:, :, seg_idx]
-
-        # c_seg: rows are powers [3,2,1,0], columns are dims (x,y,z)
-        px = c_seg[:, 0]
-        py = c_seg[:, 1]
-        pz = c_seg[:, 2]
-
-        # Dynamic contouring weight (placeholder heuristic)
-        dist_to_waypoint = np.linalg.norm(self._waypoints_pos[nearest_idx] - obs["pos"])
-        q_c = 10.0 if dist_to_waypoint < 0.5 else 1.0
-
-        params = np.zeros((14,))
-        params[0:4] = px.flatten()
-        params[4:8] = py.flatten()
-        params[8:12] = pz.flatten()
-        params[12] = q_c
-        params[13] = self._des_pos_spline.x[seg_idx]
-
-        # Set spline parameters stage-by-stage using predicted theta.
+        # Set spline parameter guess stage-by-stage using predicted theta.
         for j in range(self._N):
             if self._tick == 0:
                 # Provide a kinematic guess for the very first tick to prevent divergence
-                theta_pred = (
-                    self._current_theta + j * self._dt * 2.0
-                )  # Assume 2.0 m/s initial progress
+                theta_pred = self._current_theta + j * self._dt * 2.0
                 xj_guess = x0_aug.copy()
                 xj_guess[13] = theta_pred
                 xj_guess[14] = 2.0
@@ -429,35 +367,15 @@ class AttitudeMPC(Controller):
                 xj_prev = self._acados_ocp_solver.get(j, "x")
                 theta_pred = float(xj_prev[13])
 
-            # Clip to valid spline bounds
             theta_pred = float(
-                np.clip(theta_pred, self._des_pos_spline.x[0], self._des_pos_spline.x[-1])
+                np.clip(
+                    theta_pred, self._trajectory.knot_points[0], self._trajectory.knot_points[-1]
+                )
             )
 
-            seg_idx_j = int(np.searchsorted(self._des_pos_spline.x[1:], theta_pred, side="right"))
-            seg_idx_j = min(max(seg_idx_j, 0), n_segments - 1)
-            try:
-                c_seg_j = cs_c[:, seg_idx_j, :]
-            except Exception:
-                c_seg_j = cs_c[:, :, seg_idx_j]
-
-            px_j = c_seg_j[:, 0]
-            py_j = c_seg_j[:, 1]
-            pz_j = c_seg_j[:, 2]
-
-            pos_pred = self._des_pos_spline(theta_pred)
-
-            # Gaussian Dynamic Contouring Weight
-            q_nom = 1.0
-            q_wp = 300.0  # Peak weight at the gate
-            sigma_sq = 0.4**2  # Variance
-
-            q_c_j = q_nom
-            for gate_pos in self._gate_positions:
-                dist_sq = np.sum((pos_pred - gate_pos) ** 2)
-                q_c_j += q_wp * np.exp(-0.5 * dist_sq / sigma_sq)
-
-            theta_offset_j = self._des_pos_spline.x[seg_idx_j]
+            px_j, py_j, pz_j, theta_offset_j = self._trajectory.get_polynomial_coeffs_at(theta_pred)
+            pos_pred = self._trajectory.evaluate(theta_pred)
+            q_c_j = self._obstacle_manager.dynamic_contour_weight(pos_pred)
 
             params_j = np.zeros((14,))
             params_j[0:4] = px_j.flatten()
@@ -485,8 +403,8 @@ class AttitudeMPC(Controller):
 
         # Calculate Contour and Lag Error for Telemetry
         p_curr = obs["pos"]
-        p_ref = self._des_pos_spline(self._current_theta)
-        t_ref = self._des_vel_spline(self._current_theta)
+        p_ref = self._trajectory.evaluate(self._current_theta)
+        t_ref = self._trajectory.evaluate_velocity(self._current_theta)
         t_norm = t_ref / (np.linalg.norm(t_ref) + 1e-6)
 
         e_pos = p_curr - p_ref
@@ -494,14 +412,7 @@ class AttitudeMPC(Controller):
         e_cont_vec = e_pos - e_lag_val * t_norm
         e_cont_val = np.linalg.norm(e_cont_vec)
 
-        # Calculate current dynamic contour weight
-        q_nom = 1.0
-        q_wp = 300.0
-        sigma_sq = 0.4**2
-        q_c_current = q_nom
-        for gate_pos in self._gate_positions:
-            dist_sq = np.sum((p_ref - gate_pos) ** 2)
-            q_c_current += q_wp * np.exp(-0.5 * dist_sq / sigma_sq)
+        q_c_current = self._obstacle_manager.dynamic_contour_weight(p_ref)
 
         # Append to logs
         self._log_thrust.append(float(u0[3]))
@@ -517,10 +428,10 @@ class AttitudeMPC(Controller):
 
     def render_callback(self, sim: Sim):
         """Visualize the reference path, the current MPCC target, and the predicted horizon."""
-        trajectory = self._des_pos_spline(np.linspace(0.0, self._s_total, 150))
+        trajectory = self._trajectory.evaluate(np.linspace(0.0, self._trajectory.total_length, 150))
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
 
-        target_pos = self._des_pos_spline(self._current_theta)
+        target_pos = self._trajectory.evaluate(self._current_theta)
         draw_points(sim, target_pos.reshape(1, -1), rgba=(1.0, 0.0, 0.0, 1.0), size=0.04)
 
         if self._predicted_trajectory.shape[0] > 0:
