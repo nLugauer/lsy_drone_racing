@@ -362,7 +362,7 @@ class ObstacleManager:
         """Generate CasADi collision constraint expressions.
 
         Expressions: distance² - (radius + margin)² ≥ 0 (drone outside obstacle).
-        Used for optional hard collision constraints in future implementations.
+        Used for optional collision constraints in future implementations.
 
         Args:
             x_sym: State vector (x[0:3] is drone position).

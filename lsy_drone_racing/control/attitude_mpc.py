@@ -319,16 +319,31 @@ class AttitudeMPC(Controller):
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
         if info is not None:
+            gates_pos = None
+            gates_yaw = None
             if "gates_pos" in info:
                 gates_pos = np.array(info["gates_pos"], dtype=np.float64)
+            elif "gates_pos" in obs:
+                gates_pos = np.array(obs["gates_pos"], dtype=np.float64)
+
+            if "gates_yaw" in info:
+                gates_yaw = np.array(info["gates_yaw"], dtype=np.float64)
+            elif "gates_quat" in obs:
+                gates_quat = np.array(obs["gates_quat"], dtype=np.float64)
+                gates_yaw = R.from_quat(gates_quat).as_euler("xyz")[:, 2]
+
+            if gates_pos is not None and gates_yaw is not None:
                 gates_rpys = np.zeros((gates_pos.shape[0], 3), dtype=np.float64)
-                if "gates_yaw" in info:
-                    gates_yaw = np.array(info["gates_yaw"], dtype=np.float64)
-                    gates_rpys[:, 2] = gates_yaw
+                gates_rpys[:, 2] = gates_yaw
                 self._obstacle_manager.update_gate_positions(gates_pos, gates_rpys)
 
+            obstacles_pos = None
             if "obstacles_pos" in info:
                 obstacles_pos = np.array(info["obstacles_pos"], dtype=np.float64)
+            elif "obstacles_pos" in obs:
+                obstacles_pos = np.array(obs["obstacles_pos"], dtype=np.float64)
+
+            if obstacles_pos is not None:
                 self._obstacle_manager.update_pole_positions(obstacles_pos)
 
         # Define the terminal condition:
