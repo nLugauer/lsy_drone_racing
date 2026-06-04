@@ -42,14 +42,7 @@ class ObstacleManager:
             radius: Sphere radius in meters.
         """
         p = np.array(center, dtype=np.float64)
-        self.obstacles.append(
-            {
-                "type": "sphere",
-                "p1": p,
-                "p2": p.copy(),
-                "r": radius,
-            }
-        )
+        self.obstacles.append({"type": "sphere", "p1": p, "p2": p.copy(), "r": radius})
 
     def add_cylinder(self, start: np.ndarray, end: np.ndarray, radius: float) -> None:
         """Add a cylindrical obstacle.
@@ -96,9 +89,7 @@ class ObstacleManager:
             np.array([0, -banner_offset, -banner_offset]),
         ]
 
-        R = np.array(
-            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
-        )
+        R = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
         world_corners = [(R @ p) + center for p in local_corners]
 
         start_idx = len(self.obstacles)
@@ -148,7 +139,25 @@ class ObstacleManager:
             height: Total height from ground to top (default 1.55m).
             radius: Pole radius in meters (default 0.015m = 0.03m diameter).
         """
-        pos_arr = np.asarray(pos, dtype=np.float64)
+        # Accept several input formats for convenience: list/ndarray or dict-like
+        if isinstance(pos, dict):
+            if "pos" in pos:
+                pos_val = pos["pos"]
+            elif "position" in pos:
+                pos_val = pos["position"]
+            elif all(k in pos for k in ("x", "y", "z")):
+                pos_val = [pos["x"], pos["y"], pos["z"]]
+            else:
+                raise TypeError(
+                    "Unsupported dict format for pole position; expected keys 'pos', 'position' or 'x','y','z'"
+                )
+        else:
+            pos_val = pos
+
+        pos_arr = np.asarray(pos_val, dtype=np.float64)
+        if pos_arr.size < 3:
+            raise ValueError("Pole position must be length 3: [x, y, z_top]")
+
         z_top = pos_arr[2]
         z_bottom = z_top - height
 
@@ -191,9 +200,7 @@ class ObstacleManager:
                 np.array([0, -banner_offset, -banner_offset]),
             ]
 
-            R = np.array(
-                [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
-            )
+            R = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
             world_corners = [(R @ p) + center for p in local_corners]
 
             new_obstacles = [
@@ -390,7 +397,9 @@ class ObstacleManager:
 
         return ca.vcat(constraints)
 
-    def render(self, sim: Sim, rgba: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.3)) -> None:
+    def render(
+        self, sim: Sim, rgba: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.3)
+    ) -> None:
         """Draw all obstacles in the simulation.
 
         Args:

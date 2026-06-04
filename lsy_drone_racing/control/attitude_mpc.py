@@ -281,7 +281,7 @@ class AttitudeMPC(Controller):
             for pole_pos in config.env.track.obstacles:
                 self._obstacle_manager.add_pole(pole_pos)
 
-        self._trajectory = TrajectoryPlanner(waypoints=gate_positions)
+        self._trajectory = TrajectoryPlanner(waypoints=None)
 
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
