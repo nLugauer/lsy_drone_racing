@@ -319,11 +319,12 @@ class AttitudeMPC(Controller):
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
         if info is not None:
-            if "gates_pos" in info and "gates_yaw" in info:
+            if "gates_pos" in info:
                 gates_pos = np.array(info["gates_pos"], dtype=np.float64)
-                gates_yaw = np.array(info["gates_yaw"], dtype=np.float64)
                 gates_rpys = np.zeros((gates_pos.shape[0], 3), dtype=np.float64)
-                gates_rpys[:, 2] = gates_yaw
+                if "gates_yaw" in info:
+                    gates_yaw = np.array(info["gates_yaw"], dtype=np.float64)
+                    gates_rpys[:, 2] = gates_yaw
                 self._obstacle_manager.update_gate_positions(gates_pos, gates_rpys)
 
             if "obstacles_pos" in info:
