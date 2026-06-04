@@ -277,6 +277,10 @@ class AttitudeMPC(Controller):
         for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
             self._obstacle_manager.add_gate(gate_pos, gate_rpy)
 
+        if hasattr(config.env.track, "obstacles") and config.env.track.obstacles:
+            for pole_pos in config.env.track.obstacles:
+                self._obstacle_manager.add_pole(pole_pos)
+
         self._trajectory = TrajectoryPlanner(waypoints=gate_positions)
 
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
@@ -314,6 +318,18 @@ class AttitudeMPC(Controller):
             The orientation as roll, pitch, yaw angles, and the collective thrust
             [r_des, p_des, y_des, t_des] as a numpy array.
         """
+        if info is not None:
+            if "gates_pos" in info and "gates_yaw" in info:
+                gates_pos = np.array(info["gates_pos"], dtype=np.float64)
+                gates_yaw = np.array(info["gates_yaw"], dtype=np.float64)
+                gates_rpys = np.zeros((gates_pos.shape[0], 3), dtype=np.float64)
+                gates_rpys[:, 2] = gates_yaw
+                self._obstacle_manager.update_gate_positions(gates_pos, gates_rpys)
+
+            if "obstacles_pos" in info:
+                obstacles_pos = np.array(info["obstacles_pos"], dtype=np.float64)
+                self._obstacle_manager.update_pole_positions(obstacles_pos)
+
         # Define the terminal condition:
         # 1. Virtual progress must be near the end.
         # 2. Physical drone must be near the final waypoint.

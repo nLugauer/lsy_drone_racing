@@ -29,7 +29,7 @@ class ObstacleManager:
         self.obstacles = []
         self.gates = []
         self._gate_obstacle_indices = []
-        self._nominal_obstacle_indices = []
+        self._pole_obstacle_indices = []
         self._q_nom = 1.0
         self._q_wp = 300.0
         self._sigma_sq = 0.4**2
@@ -139,6 +139,118 @@ class ObstacleManager:
                 "outer_width": outer_width,
             }
         )
+
+    def add_pole(self, pos: list | np.ndarray, height: float = 1.55, radius: float = 0.015) -> None:
+        """Add a pole (vertical cylindrical obstacle).
+
+        Args:
+            pos: [x, y, z_top] center position (z_top is top of pole, from ground to marker).
+            height: Total height from ground to top (default 1.55m).
+            radius: Pole radius in meters (default 0.015m = 0.03m diameter).
+        """
+        pos_arr = np.asarray(pos, dtype=np.float64)
+        z_top = pos_arr[2]
+        z_bottom = z_top - height
+
+        start_point = np.array([pos_arr[0], pos_arr[1], z_bottom], dtype=np.float64)
+        end_point = np.array([pos_arr[0], pos_arr[1], z_top], dtype=np.float64)
+
+        pole_idx = len(self.obstacles)
+        self.add_cylinder(start_point, end_point, radius)
+        self._pole_obstacle_indices.append(pole_idx)
+
+    def update_gate_positions(self, gate_positions: np.ndarray, gate_rpys: np.ndarray) -> None:
+        """Update gate positions without re-planning spline.
+
+        Args:
+            gate_positions: (N, 3) array of new gate positions [x, y, z].
+            gate_rpys: (N, 3) array of new gate orientations [roll, pitch, yaw].
+        """
+        gate_positions_arr = np.asarray(gate_positions, dtype=np.float64)
+        gate_rpys_arr = np.asarray(gate_rpys, dtype=np.float64)
+
+        for gate_idx, gate in enumerate(self.gates):
+            if gate_idx >= gate_positions_arr.shape[0]:
+                break
+
+            new_pos = gate_positions_arr[gate_idx]
+            new_rpy = gate_rpys_arr[gate_idx]
+            inner_width = gate["inner_width"]
+            outer_width = gate["outer_width"]
+
+            center = np.array(new_pos, dtype=np.float64)
+            yaw = new_rpy[2]
+
+            banner_offset = (inner_width / 4.0) + (outer_width / 4.0)
+            thickness = (outer_width - inner_width) / 4.0
+
+            local_corners = [
+                np.array([0, -banner_offset, banner_offset]),
+                np.array([0, banner_offset, banner_offset]),
+                np.array([0, banner_offset, -banner_offset]),
+                np.array([0, -banner_offset, -banner_offset]),
+            ]
+
+            R = np.array(
+                [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
+            )
+            world_corners = [(R @ p) + center for p in local_corners]
+
+            new_obstacles = [
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[0],
+                    "p2": world_corners[1],
+                    "r": thickness,
+                },
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[1],
+                    "p2": world_corners[2],
+                    "r": thickness,
+                },
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[2],
+                    "p2": world_corners[3],
+                    "r": thickness,
+                },
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[3],
+                    "p2": world_corners[0],
+                    "r": thickness,
+                },
+            ]
+
+            for obs_idx, obstacle in zip(self._gate_obstacle_indices[gate_idx], new_obstacles):
+                self.obstacles[obs_idx] = obstacle
+
+            gate["pos"] = center
+            gate["rpy"] = np.array(new_rpy, dtype=np.float64)
+
+    def update_pole_positions(self, pole_positions: np.ndarray, height: float = 1.55) -> None:
+        """Update pole positions without re-planning spline.
+
+        Args:
+            pole_positions: (N, 3) array of new pole positions [x, y, z_top].
+            height: Pole height from ground to top (default 1.55m).
+        """
+        pole_positions_arr = np.asarray(pole_positions, dtype=np.float64)
+
+        for i, pole_idx in enumerate(self._pole_obstacle_indices):
+            if i >= pole_positions_arr.shape[0]:
+                break
+
+            pos = pole_positions_arr[i]
+            z_top = pos[2]
+            z_bottom = z_top - height
+
+            start_point = np.array([pos[0], pos[1], z_bottom], dtype=np.float64)
+            end_point = np.array([pos[0], pos[1], z_top], dtype=np.float64)
+
+            self.obstacles[pole_idx]["p1"] = start_point
+            self.obstacles[pole_idx]["p2"] = end_point
 
     def points_in_obstacles(self, points: np.ndarray, margin: float | None = None) -> np.ndarray:
         """Return boolean mask of points intersecting obstacles (with margin).
