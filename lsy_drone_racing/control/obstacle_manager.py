@@ -1,42 +1,341 @@
-"""Obstacle handling helper for MPC contour weight adjustment.
+"""Obstacle handling and collision detection for MPC.
 
-This module contains a future-ready interface for obstacle awareness and the
-current gate-based contour weighting logic used by the attitude MPC.
+This module provides gate modeling as capsule obstacles, collision detection,
+dynamic contour weighting, and optional hard constraint expressions for the
+attitude MPC controller.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import casadi as ca
 import numpy as np
+
+if TYPE_CHECKING:
+    from crazyflow.sim import Sim
 
 
 class ObstacleManager:
-    """Manages obstacle-related cost shaping for the MPC solver."""
+    """Manages obstacles, gates, collision detection, and MPC cost shaping."""
 
-    def __init__(
+    def __init__(self, safety_margin: float = 0.08) -> None:
+        """Initialize the obstacle manager.
+
+        Args:
+            safety_margin: Extra buffer distance (in meters) around obstacles.
+        """
+        self.safety_margin = safety_margin
+        self.obstacles = []
+        self.gates = []
+        self._gate_obstacle_indices = []
+        self._nominal_obstacle_indices = []
+        self._q_nom = 1.0
+        self._q_wp = 300.0
+        self._sigma_sq = 0.4**2
+
+    def add_sphere(self, center: np.ndarray, radius: float) -> None:
+        """Add a spherical obstacle.
+
+        Args:
+            center: Center position [x, y, z].
+            radius: Sphere radius in meters.
+        """
+        p = np.array(center, dtype=np.float64)
+        self.obstacles.append(
+            {
+                "type": "sphere",
+                "p1": p,
+                "p2": p.copy(),
+                "r": radius,
+            }
+        )
+
+    def add_cylinder(self, start: np.ndarray, end: np.ndarray, radius: float) -> None:
+        """Add a cylindrical obstacle.
+
+        Args:
+            start: Start point of cylinder axis [x, y, z].
+            end: End point of cylinder axis [x, y, z].
+            radius: Cylinder radius in meters.
+        """
+        self.obstacles.append(
+            {
+                "type": "cylinder",
+                "p1": np.array(start, dtype=np.float64),
+                "p2": np.array(end, dtype=np.float64),
+                "r": radius,
+            }
+        )
+
+    def add_gate(
         self,
-        gate_positions: np.ndarray,
-        q_nom: float = 1.0,
-        q_wp: float = 300.0,
-        sigma: float = 0.4,
+        pos: list | np.ndarray,
+        rpy: list | np.ndarray,
+        inner_width: float = 0.4,
+        outer_width: float = 0.72,
     ) -> None:
-        """Initialize the obstacle manager."""
-        self._gate_positions = gate_positions
-        self._q_nom = q_nom
-        self._q_wp = q_wp
-        self._sigma_sq = sigma**2
+        """Model a gate as 4 capsule obstacles representing the solid banner frame.
+
+        Args:
+            pos: [x, y, z] center position of the gate.
+            rpy: [roll, pitch, yaw] orientation in radians.
+            inner_width: Width/height of the opening (default 0.4m).
+            outer_width: Outer width/height of the frame (default 0.72m).
+        """
+        center = np.array(pos, dtype=np.float64)
+        yaw = rpy[2]
+
+        banner_offset = (inner_width / 4.0) + (outer_width / 4.0)
+        thickness = (outer_width - inner_width) / 4.0
+
+        local_corners = [
+            np.array([0, -banner_offset, banner_offset]),
+            np.array([0, banner_offset, banner_offset]),
+            np.array([0, banner_offset, -banner_offset]),
+            np.array([0, -banner_offset, -banner_offset]),
+        ]
+
+        R = np.array(
+            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
+        )
+        world_corners = [(R @ p) + center for p in local_corners]
+
+        start_idx = len(self.obstacles)
+        self.obstacles.extend(
+            [
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[0],
+                    "p2": world_corners[1],
+                    "r": thickness,
+                },
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[1],
+                    "p2": world_corners[2],
+                    "r": thickness,
+                },
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[2],
+                    "p2": world_corners[3],
+                    "r": thickness,
+                },
+                {
+                    "type": "cylinder",
+                    "p1": world_corners[3],
+                    "p2": world_corners[0],
+                    "r": thickness,
+                },
+            ]
+        )
+        self._gate_obstacle_indices.append(list(range(start_idx, start_idx + 4)))
+        self.gates.append(
+            {
+                "pos": center,
+                "rpy": np.array(rpy, dtype=np.float64),
+                "inner_width": inner_width,
+                "outer_width": outer_width,
+            }
+        )
+
+    def points_in_obstacles(self, points: np.ndarray, margin: float | None = None) -> np.ndarray:
+        """Return boolean mask of points intersecting obstacles (with margin).
+
+        Args:
+            points: (N, 3) array of query points.
+            margin: Collision margin. If None, uses self.safety_margin.
+
+        Returns:
+            Boolean array of shape (N,), True if point intersects an obstacle.
+        """
+        points_arr = np.asarray(points, dtype=np.float64)
+        mask = np.zeros(points_arr.shape[0], dtype=bool)
+        margin = self.safety_margin if margin is None else float(margin)
+
+        for idx, point in enumerate(points_arr):
+            for obs in self.obstacles:
+                r_total = float(obs["r"]) + margin
+                if obs["type"] == "sphere":
+                    if np.linalg.norm(point - obs["p1"]) <= r_total:
+                        mask[idx] = True
+                        break
+                else:
+                    v = obs["p2"] - obs["p1"]
+                    w = point - obs["p1"]
+                    v_norm_sq = np.dot(v, v)
+                    if v_norm_sq == 0.0:
+                        closest = obs["p1"]
+                    else:
+                        t = np.dot(w, v) / v_norm_sq
+                        t = np.clip(t, 0.0, 1.0)
+                        closest = obs["p1"] + t * v
+
+                    if np.linalg.norm(point - closest) <= r_total:
+                        mask[idx] = True
+                        break
+
+        return mask
+
+    def distance_to_obstacles(self, position: np.ndarray) -> float:
+        """Compute minimum distance from position to any obstacle surface.
+
+        Args:
+            position: Query position [x, y, z].
+
+        Returns:
+            Minimum distance (can be negative if inside obstacle).
+        """
+        position = np.asarray(position, dtype=np.float64)
+        min_dist = float("inf")
+
+        for obs in self.obstacles:
+            if obs["type"] == "sphere":
+                dist = np.linalg.norm(position - obs["p1"]) - obs["r"]
+            else:
+                v = obs["p2"] - obs["p1"]
+                w = position - obs["p1"]
+                v_norm_sq = np.dot(v, v)
+                if v_norm_sq == 0.0:
+                    closest = obs["p1"]
+                else:
+                    t = np.dot(w, v) / v_norm_sq
+                    t = np.clip(t, 0.0, 1.0)
+                    closest = obs["p1"] + t * v
+                dist = np.linalg.norm(position - closest) - obs["r"]
+
+            min_dist = min(min_dist, dist)
+
+        return float(min_dist if min_dist != float("inf") else 0.0)
 
     def dynamic_contour_weight(self, position: np.ndarray) -> float:
-        """Compute a dynamic contour weight based on gate proximity."""
+        """Compute dynamic contour weight based on gate proximity.
+
+        Near gates, increases the weighting of contour error in the MPCC cost.
+        This provides soft obstacle avoidance without hard constraints.
+
+        Args:
+            position: Current drone position [x, y, z].
+
+        Returns:
+            Contour weight q_c for the cost function.
+        """
         q_c = self._q_nom
-        for gate_pos in self._gate_positions:
-            dist_sq = np.sum((position - gate_pos) ** 2)
+        for gate in self.gates:
+            dist_sq = np.sum((position - gate["pos"]) ** 2)
             q_c += self._q_wp * np.exp(-0.5 * dist_sq / self._sigma_sq)
         return float(q_c)
 
-    def predict_future_obstacles(self, state: np.ndarray, horizon: int) -> np.ndarray:
-        """Placeholder for future obstacle predictions.
+    def get_obstacle_parameters(self) -> np.ndarray:
+        """Flatten current obstacle coordinates into 1D array for solver.
 
-        The current implementation does not yet use a dynamic prediction model,
-        but this method defines the interface for future extension.
+        Returns:
+            Flat array: [p1_x, p1_y, p1_z, p2_x, p2_y, p2_z, ...] for all obstacles.
         """
-        return np.empty((0, 3))
+        params = []
+        for obs in self.obstacles:
+            params.extend(obs["p1"])
+            params.extend(obs["p2"])
+        return np.array(params, dtype=np.float64)
+
+    def get_collision_expressions(self, x_sym: ca.MX, p_sym: ca.MX) -> ca.MX:
+        """Generate CasADi collision constraint expressions.
+
+        Expressions: distance² - (radius + margin)² ≥ 0 (drone outside obstacle).
+        Used for optional hard collision constraints in future implementations.
+
+        Args:
+            x_sym: State vector (x[0:3] is drone position).
+            p_sym: Parameter vector with obstacle coordinates.
+
+        Returns:
+            Constraint expressions as ca.MX column vector.
+        """
+        constraints = []
+        drone_pos = x_sym[0:3]
+
+        for i, obs in enumerate(self.obstacles):
+            idx = i * 6
+            p1 = p_sym[idx : idx + 3]
+            p2 = p_sym[idx + 3 : idx + 6]
+
+            r_total = obs["r"] + self.safety_margin
+
+            if obs["type"] == "sphere":
+                dist_sq = ca.sumsqr(drone_pos - p1)
+                constraints.append(dist_sq - r_total**2)
+            else:
+                v = p2 - p1
+                w = drone_pos - p1
+
+                t = ca.dot(w, v) / (ca.sumsqr(v) + 1e-9)
+                t_clamped = ca.fmax(0, ca.fmin(1, t))
+
+                closest_point = p1 + t_clamped * v
+                dist_sq = ca.sumsqr(drone_pos - closest_point)
+                constraints.append(dist_sq - r_total**2)
+
+        return ca.vcat(constraints)
+
+    def render(self, sim: Sim, rgba: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.3)) -> None:
+        """Draw all obstacles in the simulation.
+
+        Args:
+            sim: Crazyflow simulator instance.
+            rgba: Color as (red, green, blue, alpha) with values in [0, 1].
+        """
+        from crazyflow.sim.visualize import draw_capsule, draw_points
+
+        for obs in self.obstacles:
+            if obs["type"] == "sphere":
+                point = obs["p1"].reshape(1, 3)
+                draw_points(sim, points=point, rgba=np.array(rgba), size=obs["r"] * 2.0)
+            else:
+                draw_capsule(sim, p1=obs["p1"], p2=obs["p2"], radius=obs["r"], rgba=rgba)
+
+
+class CollisionConstraintBuilder:
+    """Factory for optional hard collision constraint expressions.
+
+    Used for future hard constraint integration. Currently kept for extensibility.
+    """
+
+    @staticmethod
+    def build_hard_constraints(
+        x_sym: ca.MX, p_sym: ca.MX, obstacles: list[dict], safety_margin: float
+    ) -> ca.MX:
+        """Build CasADi constraint expressions for hard collision avoidance.
+
+        Args:
+            x_sym: State vector (x[0:3] is drone position).
+            p_sym: Parameter vector with obstacle coordinates.
+            obstacles: List of obstacle dictionaries.
+            safety_margin: Extra margin around obstacles.
+
+        Returns:
+            Column vector of constraint expressions: dist² - r_total² ≥ 0.
+        """
+        constraints = []
+        drone_pos = x_sym[0:3]
+
+        for i, obs in enumerate(obstacles):
+            idx = i * 6
+            p1 = p_sym[idx : idx + 3]
+            p2 = p_sym[idx + 3 : idx + 6]
+
+            r_total = obs["r"] + safety_margin
+
+            if obs["type"] == "sphere":
+                dist_sq = ca.sumsqr(drone_pos - p1)
+                constraints.append(dist_sq - r_total**2)
+            else:
+                v = p2 - p1
+                w = drone_pos - p1
+                t = ca.dot(w, v) / (ca.sumsqr(v) + 1e-9)
+                t_clamped = ca.fmax(0, ca.fmin(1, t))
+                closest_point = p1 + t_clamped * v
+                dist_sq = ca.sumsqr(drone_pos - closest_point)
+                constraints.append(dist_sq - r_total**2)
+
+        return ca.vcat(constraints)

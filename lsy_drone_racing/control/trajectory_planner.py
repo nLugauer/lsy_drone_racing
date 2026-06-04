@@ -13,23 +13,31 @@ from scipy.interpolate import CubicSpline
 class TrajectoryPlanner:
     """Encapsulates path generation and spline evaluation for MPC."""
 
-    def __init__(self, n_eval_points: int = 500) -> None:
-        """Build the spline from fixed waypoints and prepare nearest-neighbor data."""
-        # Same waypoints as in the trajectory controller. Determined by trial and error.
-        waypoints = np.array(
-            [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
-        )
+    def __init__(self, waypoints: np.ndarray | None = None, n_eval_points: int = 500) -> None:
+        """Build the spline from waypoints and prepare nearest-neighbor data.
+
+        Args:
+            waypoints: (N, 3) array of intermediate waypoints [x, y, z].
+                      If None, uses default reference track waypoints.
+            n_eval_points: Number of points for fine-grained spline sampling.
+        """
+        if waypoints is None:
+            waypoints = np.array(
+                [
+                    [-1.5, 0.75, 0.05],
+                    [-1.0, 0.55, 0.4],
+                    [0.3, 0.35, 0.7],
+                    [1.3, -0.15, 0.9],
+                    [0.85, 0.85, 1.2],
+                    [-0.5, -0.05, 0.7],
+                    [-1.2, -0.2, 0.8],
+                    [-1.2, -0.2, 1.2],
+                    [-0.0, -0.7, 1.2],
+                    [0.5, -0.75, 1.2],
+                ]
+            )
+        else:
+            waypoints = np.asarray(waypoints, dtype=np.float64)
 
         # 1. Calculate the Euclidean distance between consecutive waypoints
         distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)

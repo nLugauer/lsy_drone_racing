@@ -271,10 +271,13 @@ class AttitudeMPC(Controller):
         self._log_v_theta = []
         self._log_q_c = []
 
-        self._trajectory = TrajectoryPlanner()
-        self._obstacle_manager = ObstacleManager(
-            np.array([g["pos"] for g in config.env.track.gates])
-        )
+        self._obstacle_manager = ObstacleManager(safety_margin=0.08)
+        gate_positions = np.array([g["pos"] for g in config.env.track.gates])
+        gate_rpys = np.array([g["rpy"] for g in config.env.track.gates])
+        for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
+            self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+
+        self._trajectory = TrajectoryPlanner(waypoints=gate_positions)
 
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
@@ -427,7 +430,7 @@ class AttitudeMPC(Controller):
         return u0
 
     def render_callback(self, sim: Sim):
-        """Visualize the reference path, the current MPCC target, and the predicted horizon."""
+        """Visualize the reference path, current MPCC target, predicted horizon, and obstacles."""
         trajectory = self._trajectory.evaluate(np.linspace(0.0, self._trajectory.total_length, 150))
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
 
@@ -436,6 +439,8 @@ class AttitudeMPC(Controller):
 
         if self._predicted_trajectory.shape[0] > 0:
             draw_line(sim, self._predicted_trajectory, rgba=(1.0, 0.5, 0.0, 1.0))
+
+        self._obstacle_manager.render(sim, rgba=(1.0, 0.0, 0.0, 0.3))
 
     def step_callback(
         self,
