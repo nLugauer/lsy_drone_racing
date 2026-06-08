@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "multi_level0.toml",
+    config: str = "multi_level2.toml",
     controller: str | None = None,
     n_runs: int = 1,
     gui: bool | None = None,
@@ -51,9 +51,9 @@ def simulate(
     # Load configuration and check if firmare should be used.
     config = load_config(Path(__file__).parents[1] / "config" / config)
     if gui is None:
-        gui = config.sim.gui
+        gui = config.sim.render
     else:
-        config.sim.gui = gui
+        config.sim.render = gui
     logger.warning(
         "The simulation currently only supports running with one controller type and one set of "
         "environment parameters (i.e. frequencies, control mode etc.). Only using the settings for "
@@ -102,7 +102,7 @@ def simulate(
             # Add up reward, collisions
 
             # Synchronize the GUI.
-            if config.sim.gui:
+            if config.sim.render:
                 if ((i * fps) % config.env.freq) < fps:
                     try:
                         env.render()

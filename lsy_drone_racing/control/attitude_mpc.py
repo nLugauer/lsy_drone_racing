@@ -9,6 +9,7 @@ Note that the trajectory uses pre-defined waypoints instead of dynamically gener
 
 from __future__ import annotations  # Python 3.10 type hints
 
+import uuid
 from typing import TYPE_CHECKING
 
 import casadi as ca
@@ -175,14 +176,20 @@ def create_ocp_solver(
     ocp.cost.cost_type = "NONLINEAR_LS"
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
+    W_contour = parameters.get("Q_c", 20.0)
+    W_lag = parameters.get("Q_l", 250.0)
+    W_controls = parameters.get("R_u", 50.0)
+    W_progress = parameters.get("mu", 0.1)
+    W_thrust = parameters.get("R_T", 250.0)
+
     W = np.zeros((ny, ny))
     # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
-    W[0:3, 0:3] = np.diag(
-        [20.0, 20.0, 20.0]
-    )  # The actual weight is driven dynamically by q_c in the model
-    W[3, 3] = 250.0  # High constant weight q_l to keep the virtual state tied to reality
-    W[4:8, 4:8] = np.diag([50.0, 50.0, 50.0, 250.0])  # Control regularization R
-    W[8, 8] = 0.1  # Progress weight mu
+    W[0:3, 0:3] = np.diag([W_contour, W_contour, W_contour])
+    W[3, 3] = W_lag  # High constant weight q_l to keep the virtual state tied to reality
+    W[4:8, 4:8] = np.diag(
+        [W_controls, W_controls, W_controls, W_thrust]
+    )  # Control regularization R
+    W[8, 8] = W_progress  # Progress weight mu
     ocp.cost.W = W
 
     # Terminal weights
@@ -269,9 +276,11 @@ def create_ocp_solver(
     # set prediction horizon
     ocp.solver_options.tf = Tf
 
+    unique_id = uuid.uuid4().hex[:8]
+
     acados_ocp_solver = AcadosOcpSolver(
         ocp,
-        json_file="c_generated_code/lsy_example_mpc.json",
+        json_file=f"c_generated_code/lsy_example_mpc_{unique_id}.json",
         verbose=verbose,
         build=True,
         generate=True,
@@ -307,6 +316,7 @@ class AttitudeMPC(Controller):
         self._log_lag = []
         self._log_v_theta = []
         self._log_q_c = []
+        self.last_solver_status = 0
 
         self._obstacle_manager = ObstacleManager(safety_margin=0.14)
         gate_positions = np.array([g["pos"] for g in config.env.track.gates])
@@ -323,9 +333,14 @@ class AttitudeMPC(Controller):
         self._trajectory = TrajectoryPlanner(start_pos=None, gates_pos=None)
 
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
+
+        if hasattr(config, "mpcc_tune"):
+            self.drone_params.update(config.mpcc_tune)
+
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, self._obstacle_manager
         )
+
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
         # For NONLINEAR_LS MPCC we read the residual sizes from the model
@@ -462,7 +477,7 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(self._N, "p", params_j)
 
         # Solve and extract first control. We run the RTI solver to meet 50 Hz real-time.
-        self._acados_ocp_solver.solve()
+        self.last_solver_status = self._acados_ocp_solver.solve()
 
         for j in range(self._N):
             xj = self._acados_ocp_solver.get(j, "x")
