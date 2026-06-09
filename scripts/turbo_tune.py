@@ -7,13 +7,18 @@ and objective function follow the methodology described by Krinner et al.
 
 from __future__ import annotations
 
-import os
-
-os.environ["SCIPY_ARRAY_API"] = "1"
-
 import copy
+import logging
 import math
+import multiprocessing as mp
+import os
+from pathlib import Path
 from typing import Any
+
+# Essential for BoTorch/PyTorch numerical stability
+os.environ["SCIPY_ARRAY_API"] = "1"
+# Prevent JAX from hogging all GPU VRAM across multiple processes
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import gymnasium
 import numpy as np
@@ -27,11 +32,16 @@ from torch import Tensor
 from torch.quasirandom import SobolEngine
 from tqdm import tqdm
 
-# Import your controller
 from lsy_drone_racing.control.attitude_mpc import AttitudeMPC
+from lsy_drone_racing.utils import load_config
 
-# Define the bounds for your parameters: [Q_c, Q_l, R_u, mu, R_T, log10(Z_l), log10(z_l)]
-# Adjust these based on the physical limits and stability of your quadrotor.
+# ANSI Color Codes for terminal UI
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+RESET = "\033[0m"
+
+# Define the bounds for parameters: [Q_c, Q_l, R_u, mu, R_T, log10(Z_l), log10(z_l)]
 BOUNDS = torch.tensor(
     [
         [1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0],  # Minimums
@@ -42,27 +52,10 @@ BOUNDS = torch.tensor(
 
 
 class TurboState:
-    """Tracks the Trust Region state for the TuRBO algorithm.
-
-    This state expands or contracts the search region based on the
-    recent success or failure of parameter evaluations.
-
-    Attributes:
-        dim: Dimensionality of the parameter space.
-        batch_size: Number of candidate points evaluated per batch.
-        length: Current length of the trust region.
-        length_min: Minimum allowable length before triggering a restart.
-        length_max: Maximum allowable length.
-        failure_counter: Number of consecutive failed batches.
-        failure_tolerance: Threshold of failures to shrink the trust region.
-        success_counter: Number of consecutive successful batches.
-        success_tolerance: Threshold of successes to expand the trust region.
-        best_value: The highest reward found so far.
-        restart_triggered: Boolean flag indicating if the region has collapsed.
-    """
+    """Tracks the Trust Region state for the TuRBO algorithm."""
 
     def __init__(self, dim: int, batch_size: int) -> None:
-        """Initialize the TuRBO state."""
+        """Initializes the TuRBO state."""
         self.dim = dim
         self.batch_size = batch_size
         self.length = 0.8
@@ -76,11 +69,7 @@ class TurboState:
         self.restart_triggered = False
 
     def update(self, y_next: Tensor) -> None:
-        """Update the trust region state based on the latest batch evaluations.
-
-        Args:
-            y_next: A tensor of rewards from the latest evaluated batch.
-        """
+        """Update the trust region state based on the latest batch evaluations."""
         if y_next.max().item() > self.best_value + 1e-3:
             self.success_counter += 1
             self.failure_counter = 0
@@ -102,11 +91,10 @@ class TurboState:
 
 def evaluate_batch(
     params_batch: np.ndarray, config: dict | Any, env: gymnasium.vector.VectorEnv
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Evaluates a batch of parameters using the ALREADY RUNNING parallel environments."""
     batch_size = params_batch.shape[0]
 
-    # We no longer create the env here. We just reset the one passed in.
     obs, info = env.reset()
 
     controllers = []
@@ -127,15 +115,12 @@ def evaluate_batch(
         ctrl = AttitudeMPC(single_obs, single_info, drone_config)
         controllers.append(ctrl)
 
-    # Tracking variables
     steps_survived = np.zeros(batch_size, dtype=np.float64)
     max_theta = np.zeros(batch_size, dtype=np.float64)
     finished = np.zeros(batch_size, dtype=bool)
     fail_counts = np.zeros(batch_size, dtype=np.float64)
 
-    total_steps = 0
     done_mask = np.zeros(batch_size, dtype=bool)
-    num_total_gates = len(config.env.track.gates)
 
     while not np.all(done_mask):
         actions = []
@@ -144,6 +129,7 @@ def evaluate_batch(
                 single_obs = {k: v[i] for k, v in obs.items()}
                 single_info = {k: v[i] for k, v in info.items()}
                 action = ctrl.compute_control(single_obs, single_info)
+
                 if ctrl.last_solver_status != 0:
                     fail_counts[i] += 1
 
@@ -156,7 +142,6 @@ def evaluate_batch(
         obs, reward, terminated, truncated, info = env.step(actions_arr)
 
         current_dones = terminated | truncated
-        total_steps += 1
 
         for i in range(batch_size):
             if not done_mask[i]:
@@ -169,10 +154,13 @@ def evaluate_batch(
                 elif current_dones[i]:
                     done_mask[i] = True
 
-    # Calculate augmented rewards
     rewards = np.zeros(batch_size, dtype=np.float64)
+    time_alive_arr = np.zeros(batch_size, dtype=np.float64)
+
     for i in range(batch_size):
         time_alive = steps_survived[i] / config.env.freq
+        time_alive_arr[i] = time_alive
+
         fail_rate = fail_counts[i] / max(steps_survived[i], 1)
         fail_penalty = 75.0 * fail_rate
 
@@ -184,19 +172,19 @@ def evaluate_batch(
     log_lines = ["\n--- Batch Results ---"]
     for i in range(batch_size):
         p = params_batch[i]
-        # Convert the log-scale parameters back to linear for printing
         Z_l_val = 10 ** p[5]
         z_l_val = 10 ** p[6]
 
         log_lines.append(
             f"Env {i} Params [Q_c, Q_l, R_u, mu, R_T, Z_l, z_l]: "
-            f"[{p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}, {p[3]:.2f}, {p[4]:.1f}, {Z_l_val:.1e}, {z_l_val:.1e}] "
+            f"[{p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}, {p[3]:.2f}, {p[4]:.1f}, "
+            f"{Z_l_val:.1e}, {z_l_val:.1e}] "
             f"-> Reward: {rewards[i]:.2f} (Theta: {max_theta[i]:.2f}m, Finished: {finished[i]})"
         )
     log_lines.append("---------------------")
     tqdm.write("\n".join(log_lines))
 
-    return rewards
+    return rewards, time_alive_arr
 
 
 def generate_batch(
@@ -207,26 +195,13 @@ def generate_batch(
     bounds: Tensor,
     n_candidates: int,
 ) -> Tensor:
-    """Generates the next batch of candidates strictly within the Trust Region.
-
-    Args:
-        state: The current TuRBO state.
-        model: The fitted Gaussian Process surrogate model.
-        x_train: Normalized training inputs.
-        y_train: Standardized training outputs (rewards).
-        bounds: Tensor of shape (2, dim) representing normalized [0, 1] bounds.
-        n_candidates: Number of points to generate.
-
-    Returns:
-        A tensor of shape (n_candidates, dim) containing normalized candidate parameters.
-    """
+    """Generates the next batch of candidates strictly within the Trust Region."""
     x_center = x_train[y_train.argmax(), :].clone()
     weights = bounds[1] - bounds[0]
 
     tr_lb = torch.clamp(x_center - weights * state.length / 2.0, bounds[0], bounds[1])
     tr_ub = torch.clamp(x_center + weights * state.length / 2.0, bounds[0], bounds[1])
 
-    # Use LogEI instead of standard EI
     q_ei = qLogExpectedImprovement(model, best_f=y_train.max())
 
     x_next, _ = optimize_acqf(
@@ -255,8 +230,11 @@ def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> 
         seed=config.env.seed,
     )
 
+    # Ensure n_init is a clean multiple of batch_size (minimum 16)
+    n_init = max(16, math.ceil(16 / batch_size) * batch_size)
+
     sobol = SobolEngine(dimension=dim, scramble=True)
-    x_init_norm = sobol.draw(n=16).to(dtype=torch.float64)
+    x_init_norm = sobol.draw(n=n_init).to(dtype=torch.float64)
     x_init = BOUNDS[0] + (BOUNDS[1] - BOUNDS[0]) * x_init_norm
 
     print(f"Evaluating initial {len(x_init)} points...")
@@ -265,8 +243,7 @@ def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> 
     x_init_np = x_init.numpy()
     for i in range(0, len(x_init_np), batch_size):
         chunk = x_init_np[i : i + batch_size]
-        # PASS ENV HERE
-        chunk_results = evaluate_batch(chunk, config, env)
+        chunk_results, _ = evaluate_batch(chunk, config, env)
         y_init_list.append(chunk_results)
 
     y_init_np = np.concatenate(y_init_list)
@@ -298,19 +275,28 @@ def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> 
         x_next_norm = generate_batch(state, model, train_x, train_y, norm_bounds, batch_size)
         x_next = BOUNDS[0] + (BOUNDS[1] - BOUNDS[0]) * x_next_norm
 
-        # PASS ENV HERE
-        y_next_np = evaluate_batch(x_next.numpy(), config, env)
+        y_next_np, t_alive_next = evaluate_batch(x_next.numpy(), config, env)
         y_next = torch.tensor(y_next_np, dtype=torch.float64).unsqueeze(-1)
 
         state.update(y_next)
         x_data = torch.cat((x_data, x_next), dim=0)
         y_data = torch.cat((y_data, y_next), dim=0)
 
+        batch_best_idx = int(np.argmax(y_next_np))
+        batch_best_t = t_alive_next[batch_best_idx]
+        batch_best_Zl = 10 ** x_next[batch_best_idx, 5].item()
+        batch_best_zl = 10 ** x_next[batch_best_idx, 6].item()
+
         current_max = float(y_next.max().item())
+        tr_color = RED if state.length < 0.05 else YELLOW
+
         pbar.set_postfix(
-            best=f"{state.best_value:.2f}",
+            best=f"{GREEN}{state.best_value:.2f}{RESET}",
             batch_max=f"{current_max:.2f}",
-            tr_length=f"{state.length:.3f}",
+            t_air=f"{batch_best_t:.1f}s",
+            Zl=f"{batch_best_Zl:.0e}",
+            zl=f"{batch_best_zl:.0e}",
+            tr_length=f"{tr_color}{state.length:.3f}{RESET}",
         )
         pbar.update(batch_size)
 
@@ -319,18 +305,13 @@ def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> 
                 "\nTrust Region collapsed! Injecting fresh points to escape local minimum..."
             )
 
-            # 1. Reset the Trust Region state
             state = TurboState(dim, batch_size=batch_size)
             state.best_value = y_data.max().item()
 
-            # 2. Draw a fresh batch of random points to force exploration
             sobol = SobolEngine(dimension=dim, scramble=True)
             x_new_norm = sobol.draw(n=batch_size).to(dtype=torch.float64)
             x_new = BOUNDS[0] + (BOUNDS[1] - BOUNDS[0]) * x_new_norm
 
-            y_new_np = evaluate_batch(x_new.numpy(), config, env)
-
-            # 3. Evaluate and append the fresh points
             y_new_np, _ = evaluate_batch(x_new.numpy(), config, env)
             y_new = torch.tensor(y_new_np, dtype=torch.float64).unsqueeze(-1)
 
@@ -338,10 +319,9 @@ def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> 
             y_data = torch.cat((y_data, y_new), dim=0)
 
     pbar.close()
-
     env.close()
 
-    best_idx = y_data.argmax()
+    best_idx = int(y_data.argmax())
     print("Optimization finished.")
     print("Best Parameters:", x_data[best_idx].numpy())
 
@@ -349,30 +329,18 @@ def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> 
 
 
 if __name__ == "__main__":
-    import os
-
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    import multiprocessing as mp
-
-    # Force Python to spawn fresh processes instead of forking
+    # Force Python to spawn fresh processes to safely initialize JAX + CUDA
     mp.set_start_method("spawn", force=True)
-
-    import logging
-    from pathlib import Path
-
-    from lsy_drone_racing.utils import load_config
 
     # Setup basic logging
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("TuRBO_Tuning")
 
-    # Path to the multi-drone configuration file
     config_path = Path(__file__).parents[1] / "config" / "multi_level2.toml"
-
     logger.info(f"Loading configuration from {config_path}")
     config = load_config(config_path)
 
-    # --- FIX: Patch multi-drone config structure to match single-drone expectations ---
+    # Patch multi-drone config structure to match single-drone expectations
     if "kwargs" in config.env:
         config.env.freq = config.env.kwargs[0]["freq"]
         config.env.sensor_range = config.env.kwargs[0]["sensor_range"]
@@ -384,8 +352,6 @@ if __name__ == "__main__":
 
     logger.info("Starting TuRBO Optimization...")
 
-    # Run the optimizer
-    # Ensure batch_size matches or is a factor of the number of parallel workers you want
     best_params = run_turbo(config, max_evals=600, batch_size=4)
 
     logger.info("========================================")
