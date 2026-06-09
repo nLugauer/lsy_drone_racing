@@ -13,7 +13,7 @@ os.environ["SCIPY_ARRAY_API"] = "1"
 
 import copy
 import math
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import gymnasium
 import numpy as np
@@ -25,17 +25,19 @@ from botorch.optim import optimize_acqf
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from torch import Tensor
 from torch.quasirandom import SobolEngine
+from tqdm import tqdm
 
 # Import your controller
 from lsy_drone_racing.control.attitude_mpc import AttitudeMPC
 
-if TYPE_CHECKING:
-    from ml_collections import ConfigDict
-
-# Define the bounds for your parameters: [Q_c, Q_l, R_u, mu]
+# Define the bounds for your parameters: [Q_c, Q_l, R_u, mu, R_T, log10(Z_l), log10(z_l)]
 # Adjust these based on the physical limits and stability of your quadrotor.
 BOUNDS = torch.tensor(
-    [[1.0, 1.0, 1.0, 0.01, 1.0], [1000.0, 5000.0, 2000.0, 10.0, 1000.0]], dtype=torch.float64
+    [
+        [1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0],  # Minimums
+        [1000.0, 1000.0, 1000.0, 5.0, 500.0, 5.0, 5.0],  # Maximums
+    ],
+    dtype=torch.float64,
 )
 
 
@@ -98,50 +100,42 @@ class TurboState:
             self.restart_triggered = True
 
 
-def evaluate_batch(params_batch: np.ndarray, config: ConfigDict | dict[str, Any]) -> np.ndarray:
-    """Evaluates a batch of parameters in parallel using isolated environments."""
+def evaluate_batch(
+    params_batch: np.ndarray, config: dict | Any, env: gymnasium.vector.VectorEnv
+) -> np.ndarray:
+    """Evaluates a batch of parameters using the ALREADY RUNNING parallel environments."""
     batch_size = params_batch.shape[0]
-    config.env.track.drones = [config.env.track.drones[0]]
 
-    # Create completely independent parallel worlds
-    env = gymnasium.make_vec(
-        "DroneRacing-v0",
-        num_envs=batch_size,
-        freq=config.env.freq,
-        sim_config=config.sim,
-        track=config.env.track,
-        sensor_range=config.env.sensor_range,
-        control_mode="attitude",
-        disturbances=config.env.get("disturbances"),
-        randomizations=config.env.get("randomizations"),
-        seed=config.env.seed,
-    )
-
+    # We no longer create the env here. We just reset the one passed in.
     obs, info = env.reset()
 
     controllers = []
     for i in range(batch_size):
         drone_config = copy.deepcopy(config)
-
         drone_config.mpcc_tune = {
             "Q_c": float(params_batch[i, 0]),
             "Q_l": float(params_batch[i, 1]),
             "R_u": float(params_batch[i, 2]),
             "mu": float(params_batch[i, 3]),
             "R_T": float(params_batch[i, 4]),
+            "Z_l": float(10 ** params_batch[i, 5]),
+            "z_l": float(10 ** params_batch[i, 6]),
         }
 
-        # VecDroneRaceEnv returns arrays of shape (batch_size, ...)
         single_obs = {k: v[i] for k, v in obs.items()}
         single_info = {k: v[i] for k, v in info.items()}
-
         ctrl = AttitudeMPC(single_obs, single_info, drone_config)
         controllers.append(ctrl)
 
-    lap_times = np.zeros(batch_size, dtype=np.float64)
+    # Tracking variables
+    steps_survived = np.zeros(batch_size, dtype=np.float64)
+    max_theta = np.zeros(batch_size, dtype=np.float64)
+    finished = np.zeros(batch_size, dtype=bool)
     fail_counts = np.zeros(batch_size, dtype=np.float64)
+
     total_steps = 0
     done_mask = np.zeros(batch_size, dtype=bool)
+    num_total_gates = len(config.env.track.gates)
 
     while not np.all(done_mask):
         actions = []
@@ -149,57 +143,59 @@ def evaluate_batch(params_batch: np.ndarray, config: ConfigDict | dict[str, Any]
             if not done_mask[i]:
                 single_obs = {k: v[i] for k, v in obs.items()}
                 single_info = {k: v[i] for k, v in info.items()}
-
                 action = ctrl.compute_control(single_obs, single_info)
-
                 if ctrl.last_solver_status != 0:
                     fail_counts[i] += 1
 
+                max_theta[i] = max(max_theta[i], ctrl._current_theta)
                 actions.append(action)
             else:
                 actions.append(np.zeros(4, dtype=np.float32))
 
-        # Shape: (batch_size, 4)
         actions_arr = np.array(actions, dtype=np.float32)
-
         obs, reward, terminated, truncated, info = env.step(actions_arr)
 
-        if config.sim.get("gui", False) or config.sim.get("render", False):
-            try:
-                env.render()
-            except Exception as e:
-                if not str(e).startswith("No known conversion for Jax type"):
-                    raise e
-
-        # In VecDroneRaceEnv, these are arrays of shape (batch_size,)
         current_dones = terminated | truncated
         total_steps += 1
 
         for i in range(batch_size):
             if not done_mask[i]:
-                # 1. Drone crossed finish line
-                if int(obs["target_gate"][i]) == -1:
-                    lap_times[i] = total_steps / config.env.freq
+                steps_survived[i] += 1
+                target_gate = int(obs["target_gate"][i])
+
+                if target_gate == -1:
+                    finished[i] = True
                     done_mask[i] = True
-                # 2. Drone crashed or timed out
                 elif current_dones[i]:
                     done_mask[i] = True
 
-    env.close()
+    # Calculate augmented rewards
+    rewards = np.zeros(batch_size, dtype=np.float64)
+    for i in range(batch_size):
+        time_alive = steps_survived[i] / config.env.freq
+        fail_rate = fail_counts[i] / max(steps_survived[i], 1)
+        fail_penalty = 75.0 * fail_rate
 
-    gamma = 100.0
-    r_fail = fail_counts / max(total_steps, 1)
+        if finished[i]:
+            rewards[i] = 1000.0 - time_alive - fail_penalty
+        else:
+            rewards[i] = (max_theta[i] * 10.0) + time_alive - fail_penalty
 
-    max_time = total_steps / config.env.freq
-    lap_times[lap_times == 0] = max_time
+    log_lines = ["\n--- Batch Results ---"]
+    for i in range(batch_size):
+        p = params_batch[i]
+        # Convert the log-scale parameters back to linear for printing
+        Z_l_val = 10 ** p[5]
+        z_l_val = 10 ** p[6]
 
-    print("\n--- Batch Results ---")
-    print(f"Lap Times (s): {np.round(lap_times, 2)}")
-    print(f"Solver Fails : {fail_counts}")
-    print(f"Rewards      : {np.round(-lap_times - (gamma * r_fail), 2)}")
-    print("---------------------\n")
+        log_lines.append(
+            f"Env {i} Params [Q_c, Q_l, R_u, mu, R_T, Z_l, z_l]: "
+            f"[{p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}, {p[3]:.2f}, {p[4]:.1f}, {Z_l_val:.1e}, {z_l_val:.1e}] "
+            f"-> Reward: {rewards[i]:.2f} (Theta: {max_theta[i]:.2f}m, Finished: {finished[i]})"
+        )
+    log_lines.append("---------------------")
+    tqdm.write("\n".join(log_lines))
 
-    rewards = -lap_times - (gamma * r_fail)
     return rewards
 
 
@@ -239,27 +235,41 @@ def generate_batch(
     return x_next
 
 
-def run_turbo(
-    config: ConfigDict | dict[str, Any], max_evals: int = 600, batch_size: int = 8
-) -> Tensor:
-    """Executes the full TuRBO optimization loop.
-
-    Args:
-        config: The simulation configuration dictionary.
-        max_evals: Maximum number of environment evaluations.
-        batch_size: Number of parallel evaluations per TuRBO iteration.
-
-    Returns:
-        The optimized parameter tensor found during the run.
-    """
+def run_turbo(config: dict | Any, max_evals: int = 600, batch_size: int = 4) -> Tensor:
+    """Runs the TuRBO optimization loop to find the best MPCC parameters."""
     dim = BOUNDS.shape[1]
+
+    print("Initializing parallel environments (this takes ~60s once)...")
+    config.env.track.drones = [config.env.track.drones[0]]
+    env = gymnasium.make_vec(
+        "DroneRacing-v0",
+        num_envs=batch_size,
+        vectorization_mode="async",
+        freq=config.env.freq,
+        sim_config=config.sim,
+        track=config.env.track,
+        sensor_range=config.env.sensor_range,
+        control_mode="attitude",
+        disturbances=config.env.get("disturbances"),
+        randomizations=config.env.get("randomizations"),
+        seed=config.env.seed,
+    )
 
     sobol = SobolEngine(dimension=dim, scramble=True)
     x_init_norm = sobol.draw(n=16).to(dtype=torch.float64)
     x_init = BOUNDS[0] + (BOUNDS[1] - BOUNDS[0]) * x_init_norm
 
     print(f"Evaluating initial {len(x_init)} points...")
-    y_init_np = evaluate_batch(x_init.numpy(), config)
+
+    y_init_list = []
+    x_init_np = x_init.numpy()
+    for i in range(0, len(x_init_np), batch_size):
+        chunk = x_init_np[i : i + batch_size]
+        # PASS ENV HERE
+        chunk_results = evaluate_batch(chunk, config, env)
+        y_init_list.append(chunk_results)
+
+    y_init_np = np.concatenate(y_init_list)
     y_init = torch.tensor(y_init_np, dtype=torch.float64).unsqueeze(-1)
 
     x_data = x_init
@@ -272,8 +282,12 @@ def run_turbo(
         [torch.zeros(dim, dtype=torch.float64), torch.ones(dim, dtype=torch.float64)]
     )
 
+    pbar = tqdm(
+        total=max_evals, initial=len(x_data), desc="TuRBO Tuning", dynamic_ncols=True, colour="CYAN"
+    )
+    pbar.set_postfix(best=state.best_value, tr_length=state.length)
+
     while len(x_data) < max_evals:
-        # Standardize outputs and normalize inputs
         train_y = (y_data - y_data.mean()) / (y_data.std() + 1e-9)
         train_x = (x_data - BOUNDS[0]) / (BOUNDS[1] - BOUNDS[0])
 
@@ -284,21 +298,48 @@ def run_turbo(
         x_next_norm = generate_batch(state, model, train_x, train_y, norm_bounds, batch_size)
         x_next = BOUNDS[0] + (BOUNDS[1] - BOUNDS[0]) * x_next_norm
 
-        y_next_np = evaluate_batch(x_next.numpy(), config)
+        # PASS ENV HERE
+        y_next_np = evaluate_batch(x_next.numpy(), config, env)
         y_next = torch.tensor(y_next_np, dtype=torch.float64).unsqueeze(-1)
 
         state.update(y_next)
         x_data = torch.cat((x_data, x_next), dim=0)
         y_data = torch.cat((y_data, y_next), dim=0)
 
-        print(
-            f"Evals: {len(x_data)} | Best Reward: {state.best_value:.4f} | "
-            f"TR Length: {state.length:.3f}"
+        current_max = float(y_next.max().item())
+        pbar.set_postfix(
+            best=f"{state.best_value:.2f}",
+            batch_max=f"{current_max:.2f}",
+            tr_length=f"{state.length:.3f}",
         )
+        pbar.update(batch_size)
 
         if state.restart_triggered:
-            print("Trust Region collapsed. Triggering restart...")
-            break
+            tqdm.write(
+                "\nTrust Region collapsed! Injecting fresh points to escape local minimum..."
+            )
+
+            # 1. Reset the Trust Region state
+            state = TurboState(dim, batch_size=batch_size)
+            state.best_value = y_data.max().item()
+
+            # 2. Draw a fresh batch of random points to force exploration
+            sobol = SobolEngine(dimension=dim, scramble=True)
+            x_new_norm = sobol.draw(n=batch_size).to(dtype=torch.float64)
+            x_new = BOUNDS[0] + (BOUNDS[1] - BOUNDS[0]) * x_new_norm
+
+            y_new_np = evaluate_batch(x_new.numpy(), config, env)
+
+            # 3. Evaluate and append the fresh points
+            y_new_np, _ = evaluate_batch(x_new.numpy(), config, env)
+            y_new = torch.tensor(y_new_np, dtype=torch.float64).unsqueeze(-1)
+
+            x_data = torch.cat((x_data, x_new), dim=0)
+            y_data = torch.cat((y_data, y_new), dim=0)
+
+    pbar.close()
+
+    env.close()
 
     best_idx = y_data.argmax()
     print("Optimization finished.")
@@ -308,6 +349,14 @@ def run_turbo(
 
 
 if __name__ == "__main__":
+    import os
+
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    import multiprocessing as mp
+
+    # Force Python to spawn fresh processes instead of forking
+    mp.set_start_method("spawn", force=True)
+
     import logging
     from pathlib import Path
 
@@ -330,16 +379,30 @@ if __name__ == "__main__":
         config.env.control_mode = config.env.kwargs[0]["control_mode"]
 
     # Force GUI to false during high-speed parallel tuning to save compute
-    config.sim.gui = True
-    config.sim.render = True
+    config.sim.gui = False
+    config.sim.render = False
 
     logger.info("Starting TuRBO Optimization...")
 
     # Run the optimizer
     # Ensure batch_size matches or is a factor of the number of parallel workers you want
-    best_params = run_turbo(config, max_evals=600, batch_size=2)
+    best_params = run_turbo(config, max_evals=600, batch_size=4)
 
     logger.info("========================================")
     logger.info("Optimization Finished!")
-    logger.info(f"Best Parameters [Q_c, Q_l, R_u, mu, R_T]:\n{best_params.numpy()}")
+
+    best_np = best_params.numpy()
+    Z_l_val = 10 ** best_np[5]
+    z_l_val = 10 ** best_np[6]
+
+    logger.info(
+        f"Best Parameters:\n"
+        f"  Q_c : {best_np[0]:.2f}\n"
+        f"  Q_l : {best_np[1]:.2f}\n"
+        f"  R_u : {best_np[2]:.2f}\n"
+        f"  mu  : {best_np[3]:.2f}\n"
+        f"  R_T : {best_np[4]:.2f}\n"
+        f"  Z_l : {Z_l_val:.2e}\n"
+        f"  z_l : {z_l_val:.2e}"
+    )
     logger.info("========================================")

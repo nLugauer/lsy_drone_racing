@@ -31,7 +31,9 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def create_acados_model(parameters: dict, obs_manager: ObstacleManager) -> AcadosModel:
+def create_acados_model(
+    parameters: dict, obs_manager: ObstacleManager, unique_id: str
+) -> AcadosModel:
     """Creates an acados model from a symbolic drone_model."""
     # Build base symbolic variables (outside the read-only drone-models library)
     x_base = ca.MX.sym("x_base", 13, 1)
@@ -79,7 +81,7 @@ def create_acados_model(parameters: dict, obs_manager: ObstacleManager) -> Acado
 
     # Initialize the nonlinear model for NMPC formulation
     model = AcadosModel()
-    model.name = "mpcc_attitude_mpc"
+    model.name = f"mpcc_attitude_mpc_{unique_id}"
     model.x = x_aug
     model.u = u_aug
     model.f_expl_expr = x_dot_aug
@@ -153,9 +155,10 @@ def create_ocp_solver(
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Creates an acados Optimal Control Problem and Solver."""
     ocp = AcadosOcp()
+    unique_id = uuid.uuid4().hex[:8]
 
     # Set model (augmented with MPCC states/inputs)
-    ocp.model = create_acados_model(parameters, obs_manager)
+    ocp.model = create_acados_model(parameters, obs_manager, unique_id)
 
     # Get Dimensions
     nx = ocp.model.x.rows()
@@ -215,14 +218,14 @@ def create_ocp_solver(
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
     # TODO: revert roll/pitch/yaw limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
-    ocp.constraints.lbx = np.array([-1.0, -1.0, -1.0, 0.0])
-    ocp.constraints.ubx = np.array([1.0, 1.0, 1.0, 10.0])
+    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5, 0.0])
+    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5, 10.0])
     ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
     # TODO: revert roll/pitch limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
-    ocp.constraints.lbu = np.array([-1.0, -1.0, -1.0, parameters["thrust_min"] * 4, 0.01])
-    ocp.constraints.ubu = np.array([1.0, 1.0, 1.0, parameters["thrust_max"] * 4, 10.0])
+    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, 0.01])
+    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 10.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -244,8 +247,11 @@ def create_ocp_solver(
         # Zl / Zu are L2 (Quadratic) weights
         # zl / zu are L1 (Linear) weights
         # We penalize violating the lower bound heavily
-        Z_l = 4e3 * np.ones(nh)
-        z_l = 4e3 * np.ones(nh)
+        Z_l_weight = parameters.get("Z_l", 4000.0)
+        z_l_weight = parameters.get("z_l", 4000.0)
+
+        Z_l = Z_l_weight * np.ones(nh)
+        z_l = z_l_weight * np.ones(nh)
 
         ocp.cost.Zl = Z_l
         ocp.cost.Zu = np.zeros(nh)
