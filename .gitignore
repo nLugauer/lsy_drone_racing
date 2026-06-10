@@ -9,7 +9,6 @@ saves
 .pytest_cache
 **/*.json
 !devcontainer.json
-**/*.csv
 plots/
 c_generated_code/
 /build
