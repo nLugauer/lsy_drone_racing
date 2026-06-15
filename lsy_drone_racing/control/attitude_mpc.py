@@ -9,12 +9,15 @@ Note that the trajectory uses pre-defined waypoints instead of dynamically gener
 
 from __future__ import annotations  # Python 3.10 type hints
 
+import json
+import os
 import uuid
 from typing import TYPE_CHECKING
 
 import casadi as ca
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from crazyflow.sim.visualize import draw_line, draw_points
 from drone_models.core import load_params
@@ -171,10 +174,6 @@ def create_ocp_solver(
     ocp.solver_options.N_horizon = N
 
     ## Set Cost
-    # For more Information regarding Cost Function Definition in Acados:
-    # https://github.com/acados/acados/blob/main/docs/problem_formulation/problem_formulation_ocp_mex.pdf
-    #
-
     # Cost Type: use NONLINEAR_LS for MPCC formulation
     ocp.cost.cost_type = "NONLINEAR_LS"
     ocp.cost.cost_type_e = "NONLINEAR_LS"
@@ -203,8 +202,7 @@ def create_ocp_solver(
 
     # Set initial references.
     yref = np.zeros((ny,))
-    # Here is the trick: set the reference for v_theta (index 8) to a high target speed.
-    # The solver will minimize (v_theta - 15.0)^2, pushing the drone to go faster.
+    # Reference for v_theta (index 8) to a high target speed.
     yref[8] = 15.0
     # Prevent the optimizer from collapsing thrust to zero by targeting hover thrust.
     yref[7] = parameters["mass"] * np.linalg.norm(parameters["gravity_vec"])
@@ -217,13 +215,11 @@ def create_ocp_solver(
     ocp.model.cost_y_expr_e = ocp.model.cost_y_expr_e
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
-    # TODO: revert roll/pitch/yaw limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
     ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5, 0.0])
     ocp.constraints.ubx = np.array([0.5, 0.5, 0.5, 10.0])
     ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
-    # TODO: revert roll/pitch limits back to [-0.5, -0.5, -0.5] / [0.5, 0.5, 0.5]
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, 0.01])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 10.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
@@ -244,9 +240,6 @@ def create_ocp_solver(
         ocp.constraints.idxsh_e = np.arange(nh)
 
         # Linear-Quadratic Penalty Weights
-        # Zl / Zu are L2 (Quadratic) weights
-        # zl / zu are L1 (Linear) weights
-        # We penalize violating the lower bound heavily
         Z_l_weight = parameters.get("Z_l", 4000.0)
         z_l_weight = parameters.get("z_l", 4000.0)
 
@@ -338,10 +331,59 @@ class AttitudeMPC(Controller):
         # None for hardcoded trajectory; gate_positions and start_pos for gates as waypoints
         self._trajectory = TrajectoryPlanner(start_pos=None, gates_pos=None)
 
+        # ------------------------------------------------------------------
+        # PARAMETER CONFIGURATION LOADING SYSTEM
+        # ------------------------------------------------------------------
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
+        mpcc_params = {}
 
-        if hasattr(config, "mpcc_tune"):
-            self.drone_params.update(config.mpcc_tune)
+        # Safely detect if config is a dictionary namespace or dot-accessible object
+        if isinstance(config, dict):
+            mpcc_tune = config.get("mpcc_tune", {})
+            config_file = config.get("mpcc_config_file", None)
+        else:
+            mpcc_tune = getattr(config, "mpcc_tune", {})
+            config_file = getattr(config, "mpcc_config_file", None)
+
+        # Stage 1: Check for an external config file path or fallback to default 'mpcc_config.yaml'
+        if config_file and os.path.exists(config_file):
+            try:
+                with open(config_file, "r") as f:
+                    if config_file.endswith((".yaml", ".yml")):
+                        mpcc_params = yaml.safe_load(f) or {}
+                    elif config_file.endswith(".json"):
+                        mpcc_params = json.load(f) or {}
+                print(f"Loaded MPCC configuration from file: {config_file}")
+            except Exception as e:
+                print(f"Failed to parse config file {config_file}: {e}")
+        elif os.path.exists("mpcc_config.yaml"):
+            try:
+                with open("mpcc_config.yaml", "r") as f:
+                    mpcc_params = yaml.safe_load(f) or {}
+                print("Loaded optimized parameters from default 'mpcc_config.yaml'")
+            except Exception as e:
+                print(f"Failed to parse default mpcc_config.yaml: {e}")
+
+        # Stage 2: Merge or override from direct `config.mpcc_tune` if it exists
+        if mpcc_tune:
+            if hasattr(mpcc_tune, "to_container"):  # Support OmegaConf structures
+                mpcc_params.update(mpcc_tune.to_container(structured=True))
+            elif isinstance(mpcc_tune, dict):
+                mpcc_params.update(mpcc_tune)
+            else:
+                for key in ["Q_c", "Q_l", "R_u", "mu", "R_T", "Z_l", "z_l"]:
+                    if hasattr(mpcc_tune, key):
+                        mpcc_params[key] = getattr(mpcc_tune, key)
+
+        # Stage 3: Map values into drone parameter lookup dictionary
+        if mpcc_params:
+            print("Applying structural MPCC controller parameter updates:")
+            for k, v in mpcc_params.items():
+                print(f"  {k} -> {v}")
+                self.drone_params[k] = (
+                    float(v) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else v
+                )
+        # ------------------------------------------------------------------
 
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, self._obstacle_manager
@@ -349,7 +391,6 @@ class AttitudeMPC(Controller):
 
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
-        # For NONLINEAR_LS MPCC we read the residual sizes from the model
         try:
             self._ny = int(self._ocp.model.cost_y_expr.rows())
         except Exception:
@@ -367,17 +408,7 @@ class AttitudeMPC(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        """Compute the next desired collective thrust and roll/pitch/yaw of the drone.
-
-        Args:
-            obs: The current observation of the environment. See the environment's observation space
-                for details.
-            info: Optional additional information as a dictionary.
-
-        Returns:
-            The orientation as roll, pitch, yaw angles, and the collective thrust
-            [r_des, p_des, y_des, t_des] as a numpy array.
-        """
+        """Compute the next desired collective thrust and roll/pitch/yaw of the drone."""
         if info is not None:
             gates_pos = None
             gates_yaw = None
@@ -406,27 +437,20 @@ class AttitudeMPC(Controller):
             if obstacles_pos is not None:
                 self._obstacle_manager.update_pole_positions(obstacles_pos)
 
-        # Define the terminal condition:
-        # The environment sets target_gate to -1 exactly when the final gate plane is crossed.
         if "target_gate" in obs and int(obs["target_gate"]) == -1:
             self._finished = True
 
-        # Setting initial state
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
         obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
         x0 = np.concatenate((obs["pos"], obs["rpy"], obs["vel"], obs["drpy"], [self._last_thrust]))
 
-        # Use persistent virtual progress states instead of resetting them every tick.
         theta0 = self._current_theta
         v_theta0 = self._current_v_theta
 
-        # Augmented state has physical states, rotor velocity, and two virtual progress states.
         x0_aug = np.concatenate((x0, np.array([theta0, v_theta0])))
         self._acados_ocp_solver.set(0, "lbx", x0_aug)
         self._acados_ocp_solver.set(0, "ubx", x0_aug)
 
-        # For MPCC we provide the spline coefficients and a contouring weight in model.p.
-        # Define the reference residual target with hover thrust and target speed
         yref_target = np.zeros((self._ny,))
         yref_target[7] = self.drone_params["mass"] * 9.81  # Hover thrust
         yref_target[8] = 15.0  # Target progress speed (v_theta)
@@ -434,19 +458,15 @@ class AttitudeMPC(Controller):
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref_target)
 
-        # Terminal yref zero (size ny_e)
         yref_e_zero = np.zeros((self._ny_e,))
         self._acados_ocp_solver.set(self._N, "y_ref", yref_e_zero)
 
-        # Extract flattened obstacle parameters
         obs_params = self._obstacle_manager.get_obstacle_parameters()
         num_obs = len(self._obstacle_manager.obstacles)
         total_params = 14 + (6 * num_obs)
 
-        # Set spline parameter guess stage-by-stage using predicted theta.
         for j in range(self._N):
             if self._tick == 0:
-                # Provide a kinematic guess for the very first tick to prevent divergence
                 theta_pred = self._current_theta + j * self._dt * 2.0
                 xj_guess = x0_aug.copy()
                 xj_guess[13] = theta_pred
@@ -455,7 +475,6 @@ class AttitudeMPC(Controller):
                 self._acados_ocp_solver.set(j, "x", xj_guess)
                 self._acados_ocp_solver.set(j, "u", hover_u)
             else:
-                # Use the solver's optimized trajectory from the previous tick as the segment guess
                 xj_prev = self._acados_ocp_solver.get(j, "x")
                 theta_pred = float(xj_prev[13])
 
@@ -475,14 +494,12 @@ class AttitudeMPC(Controller):
             params_j[8:12] = pz_j.flatten()
             params_j[12] = q_c_j
             params_j[13] = theta_offset_j
-            params_j[14:] = obs_params  # Inject dynamic obstacles
+            params_j[14:] = obs_params
 
             self._acados_ocp_solver.set(j, "p", params_j)
 
-        # Set parameters for the terminal node (N)
         self._acados_ocp_solver.set(self._N, "p", params_j)
 
-        # Solve and extract first control. We run the RTI solver to meet 50 Hz real-time.
         self.last_solver_status = self._acados_ocp_solver.solve()
 
         for j in range(self._N):
@@ -495,9 +512,8 @@ class AttitudeMPC(Controller):
         self._current_v_theta = float(x1_opt[14])
 
         u0 = u0_aug[0:4]
-        self._last_thrust = float(u0[3])  # Save thrust command for next tick
+        self._last_thrust = float(u0[3])
 
-        # Calculate Contour and Lag Error for Telemetry
         p_curr = obs["pos"]
         p_ref = self._trajectory.evaluate(self._current_theta)
         t_ref = self._trajectory.evaluate_velocity(self._current_theta)
@@ -510,7 +526,6 @@ class AttitudeMPC(Controller):
 
         q_c_current = self._obstacle_manager.dynamic_contour_weight(p_ref)
 
-        # Append to logs
         self._log_thrust.append(float(u0[3]))
         self._log_roll.append(float(u0[0]))
         self._log_pitch.append(float(u0[1]))
@@ -546,7 +561,6 @@ class AttitudeMPC(Controller):
     ) -> bool:
         """Increment the tick counter."""
         self._tick += 1
-
         return self._finished
 
     def episode_callback(self):
@@ -559,14 +573,12 @@ class AttitudeMPC(Controller):
 
             fig, axs = plt.subplots(5, 1, figsize=(10, 15), sharex=True)
 
-            # 1. Tracking Errors
             axs[0].plot(self._log_contour, label="Contour Error (e_c)")
             axs[0].plot(self._log_lag, label="Lag Error (e_l)")
             axs[0].set_ylabel("Error [m]")
             axs[0].legend()
             axs[0].grid(True)
 
-            # 2. Attitude Commands
             axs[1].plot(self._log_roll, label="Roll Command")
             axs[1].plot(self._log_pitch, label="Pitch Command")
             axs[1].axhline(0.5, color="r", linestyle="--", label="Upper Limit")
@@ -575,7 +587,6 @@ class AttitudeMPC(Controller):
             axs[1].legend()
             axs[1].grid(True)
 
-            # 3. Thrust Command
             axs[2].plot(self._log_thrust, label="Thrust Command")
             axs[2].axhline(hover_thrust, color="g", linestyle=":", label="Hover")
             axs[2].axhline(max_thrust, color="r", linestyle="--", label="Max Thrust")
@@ -584,14 +595,12 @@ class AttitudeMPC(Controller):
             axs[2].legend()
             axs[2].grid(True)
 
-            # 4. Progress Speed
             axs[3].plot(self._log_v_theta, label="Virtual Speed (v_theta)")
             axs[3].axhline(15.0, color="g", linestyle="--", label="Target Speed")
             axs[3].set_ylabel("Speed [m/s]")
             axs[3].legend()
             axs[3].grid(True)
 
-            # 5. Dynamic Contour Weight
             axs[4].plot(self._log_q_c, label="Contour Weight (q_c)", color="purple")
             axs[4].set_ylabel("Weight")
             axs[4].set_xlabel("Timestep")
