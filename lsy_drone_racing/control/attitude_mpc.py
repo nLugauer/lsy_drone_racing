@@ -183,6 +183,7 @@ def create_ocp_solver(
     W_controls = parameters.get("R_u", 50.0)
     W_progress = parameters.get("mu", 0.1)
     W_thrust = parameters.get("R_T", 250.0)
+    W_omega = parameters.get("Q_omega", 10.0)
 
     W = np.zeros((ny, ny))
     # Weights: [Contour(3), Lag(1), Controls(4), Progress(1)]
@@ -192,6 +193,9 @@ def create_ocp_solver(
         [W_controls, W_controls, W_controls, W_thrust]
     )  # Control regularization R
     W[8, 8] = W_progress  # Progress weight mu
+    # Assuming the last 3 elements of your residual map to wx, wy, wz
+    if ny >= 12:
+        W[9:12, 9:12] = np.diag([W_omega, W_omega, W_omega])
     ocp.cost.W = W
 
     # Terminal weights
@@ -301,7 +305,7 @@ class AttitudeMPC(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
-        self._N = 25
+        self._N = 35
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
@@ -316,16 +320,6 @@ class AttitudeMPC(Controller):
         self._log_v_theta = []
         self._log_q_c = []
         self.last_solver_status = 0
-
-        self._obstacle_manager = ObstacleManager(safety_margin=0.14)
-        gate_positions = np.array([g["pos"] for g in config.env.track.gates])
-        gate_rpys = np.array([g["rpy"] for g in config.env.track.gates])
-        for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
-            self._obstacle_manager.add_gate(gate_pos, gate_rpy)
-
-        if hasattr(config.env.track, "obstacles") and config.env.track.obstacles:
-            for pole_pos in config.env.track.obstacles:
-                self._obstacle_manager.add_pole(pole_pos)
 
         # start_pos = obs["pos"]
         # None for hardcoded trajectory; gate_positions and start_pos for gates as waypoints
@@ -371,20 +365,46 @@ class AttitudeMPC(Controller):
             elif isinstance(mpcc_tune, dict):
                 mpcc_params.update(mpcc_tune)
             else:
-                for key in ["Q_c", "Q_l", "R_u", "mu", "R_T", "Z_l", "z_l"]:
+                keys_to_extract = [
+                    "Q_c",
+                    "Q_l",
+                    "R_u",
+                    "mu",
+                    "R_T",
+                    "Z_l",
+                    "z_l",
+                    "q_wp",
+                    "sigma_sq",
+                    "Q_omega",
+                ]
+                for key in keys_to_extract:
                     if hasattr(mpcc_tune, key):
                         mpcc_params[key] = getattr(mpcc_tune, key)
 
         # Stage 3: Map values into drone parameter lookup dictionary
         if mpcc_params:
-            print("Applying structural MPCC controller parameter updates:")
+            # print("Applying structural MPCC controller parameter updates:")
             for k, v in mpcc_params.items():
-                print(f"  {k} -> {v}")
+                # print(f"  {k} -> {v}")
                 self.drone_params[k] = (
                     float(v) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else v
                 )
         # ------------------------------------------------------------------
 
+        # Instantiate ObstacleManager exactly once, using the fully loaded drone_params
+        self._obstacle_manager = ObstacleManager(safety_margin=0.08, tune_params=self.drone_params)
+
+        # Populate the ObstacleManager with the track layout
+        gate_positions = np.array([g["pos"] for g in config.env.track.gates])
+        gate_rpys = np.array([g["rpy"] for g in config.env.track.gates])
+        for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
+            self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+
+        if hasattr(config.env.track, "obstacles") and config.env.track.obstacles:
+            for pole_pos in config.env.track.obstacles:
+                self._obstacle_manager.add_pole(pole_pos)
+
+        # Compile the Acados OCP solver with the fully initialized obstacles and parameters
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, self._obstacle_manager
         )

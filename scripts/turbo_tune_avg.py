@@ -44,14 +44,16 @@ YELLOW = "\033[93m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
-# Define the bounds for parameters: [Q_c, Q_l, R_u, mu, R_T, log10(Z_l), log10(z_l)]
+# Define bounds: [Q_c, Q_l, R_u, mu, R_T, log10(Z_l), log10(z_l), q_wp, sigma_sq, Q_omega]
+# fmt: off
 BOUNDS = torch.tensor(
     [
-        [1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0],  # Minimums
-        [2000.0, 2000.0, 1000.0, 10.0, 1000.0, 5.5, 5.5],  # Maximums
+        [  1.0,   1.0,    1.0, 0.1,   1.0, 1.0, 1.0,  20.0, 0.01,   1.0],  # Minimums
+        [600.0, 600.0, 1000.0, 5.0, 600.0, 5.5, 4.5, 500.0,  1.0, 100.0],  # Maximums
     ],
     dtype=torch.float64,
 )
+# fmt: on
 
 
 class TurboState:
@@ -112,6 +114,9 @@ def evaluate_robust(
             "R_T": float(p[4]),
             "Z_l": float(10 ** p[5]),
             "z_l": float(10 ** p[6]),
+            "q_wp": float(p[7]),
+            "sigma_sq": float(p[8]),
+            "Q_omega": float(p[9]),
         }
 
         single_obs = {k: v[i] for k, v in obs.items()}
@@ -179,8 +184,11 @@ def evaluate_robust(
 
     tqdm.write(
         f"\n--- Robust Eval [{num_envs} tracks] ---\n"
-        f"Params: [Q_c:{p[0]:.0f}, Q_l:{p[1]:.0f}, R_u:{p[2]:.0f}, mu:{p[3]:.2f}, R_T:{p[4]:.0f}, Z_l:{Z_l_val:.1e}, z_l:{z_l_val:.1e}]\n"
-        f"Mean Reward: {mean_reward:.2f} | Worst: {min_reward:.2f} | Finishes: {success_rate * 100:.0f}%\n"
+        f"Params: [Q_c:{p[0]:.0f}, Q_l:{p[1]:.0f}, R_u:{p[2]:.0f}, "
+        f"mu:{p[3]:.2f}, R_T:{p[4]:.0f}, Z_l:{Z_l_val:.1e}, "
+        f"z_l:{z_l_val:.1e}, q_wp:{p[7]:.0f}, sig:{p[8]:.2f}, Q_w:{p[9]:.0f}]\n"
+        f"Mean Reward: {mean_reward:.2f} | Worst: {min_reward:.2f} | "
+        f"Finishes: {success_rate * 100:.0f}%\n"
         f"-----------------------------"
     )
 
@@ -340,6 +348,9 @@ def run_turbo(config: dict | Any, max_evals: int = 600, num_envs: int = 4) -> Te
                     p[4],
                     10 ** p[5],
                     10 ** p[6],
+                    p[7],
+                    p[8],
+                    p[9],
                     metrics["mean_reward"],
                     metrics["min_reward"],
                     metrics["success_rate"],
@@ -426,7 +437,7 @@ if __name__ == "__main__":
     logger.info("Starting TuRBO Optimization...")
 
     # num_envs is fully adjustable here. Defaulting to 4 for a 4-core CPU SAA.
-    best_params = run_turbo(config, max_evals=600, num_envs=4)
+    best_params = run_turbo(config, max_evals=600, num_envs=8)
 
     best_np = best_params.numpy()
     logger.info(

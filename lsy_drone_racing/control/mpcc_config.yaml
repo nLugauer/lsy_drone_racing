@@ -1,9 +1,18 @@
 # mpcc_config.yaml
 # Optimized parameters from TuRBO optimization run
-Q_c: 1.00
-Q_l: 1.00
-R_u: 1000.00
-mu: 0.10
-R_T: 1.00
-Z_l: 3.16e+05
-z_l: 6.17e+03
+
+# --- Core MPCC Weights ---
+Q_c: 1.00        # Contour Error Weight (Penalizes perpendicular deviation from the path)
+Q_l: 1.00        # Lag Error Weight (Penalizes longitudinal deviation from the virtual reference point)
+R_u: 1000.00     # Control Effort Penalty (Penalizes aggressive roll, pitch, and yaw commands)
+mu: 0.50         # Progress Weight (Rewards maximizing the virtual forward speed, v_theta)
+R_T: 1.00        # Thrust Control Penalty (Penalizes aggressive changes in collective thrust)
+
+# --- Obstacle Avoidance Slack Penalties ---
+Z_l: 3.16e+05    # Linear Slack Penalty (High linear cost for breaching obstacle/pole boundaries)
+z_l: 6.17e+03    # Quadratic Slack Penalty (High squared cost for breaching obstacle/pole boundaries)
+
+# --- Dynamic Contouring & Angular Penalties ---
+q_wp: 150.0      # Peak Gate Contour Weight (Dynamic multiplier for contour error when exactly inside a gate)
+sigma_sq: 0.0625 # Gaussian Spread (Variance defining how wide the magnetic "attraction zone" of a gate is)
+Q_omega: 10.0    # Angular Velocity Penalty (Penalizes high body rates to prevent the drone from flipping out)

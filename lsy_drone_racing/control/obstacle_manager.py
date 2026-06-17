@@ -19,20 +19,18 @@ if TYPE_CHECKING:
 class ObstacleManager:
     """Manages obstacles, gates, collision detection, and MPC cost shaping."""
 
-    def __init__(self, safety_margin: float = 0.08) -> None:
-        """Initialize the obstacle manager.
-
-        Args:
-            safety_margin: Extra buffer distance (in meters) around obstacles.
-        """
+    def __init__(self, safety_margin: float = 0.08, tune_params: dict | None = None) -> None:
+        """Initialize the obstacle manager."""
         self.safety_margin = safety_margin
         self.obstacles = []
         self.gates = []
         self._gate_obstacle_indices = []
         self._pole_obstacle_indices = []
+
+        tune_params = tune_params or {}
         self._q_nom = 1.0
-        self._q_wp = 150.0
-        self._sigma_sq = 0.25**2
+        self._q_wp = tune_params.get("q_wp", 150.0)
+        self._sigma_sq = tune_params.get("sigma_sq", 0.0625)  # 0.25**2
 
     def add_sphere(self, center: np.ndarray, radius: float) -> None:
         """Add a spherical obstacle.
