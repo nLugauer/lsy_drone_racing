@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
+
 def create_acados_model(
     parameters: dict, obs_manager: ObstacleManager, unique_id: str
 ) -> AcadosModel:
