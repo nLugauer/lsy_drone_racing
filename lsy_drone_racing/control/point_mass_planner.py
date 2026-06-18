@@ -519,16 +519,27 @@ class PointMassPlanner:
     def _gate_normals(
         self, start_pos: np.ndarray, centers: list[np.ndarray], gate_rpys: np.ndarray | None
     ) -> list[np.ndarray]:
-        """Travel-direction unit normals per gate (from yaw if given, else segment direction)."""
+        """Required crossing direction (unit vector) for each gate.
+
+        The race environment only registers a gate as passed when the drone crosses its plane in
+        the gate's +x direction (from the -x side to the +x side; see ``gate_passed`` in
+        ``envs/utils.py``). The gate's +x axis in world frame is ``[cos(yaw), sin(yaw), 0]``, so
+        the planned crossing velocity MUST point along it.
+
+        We deliberately do NOT flip the normal toward the approach direction. A geometry-aligned
+        (flipped) normal can make the planner cross a gate the wrong way; the env then does not
+        count it, the gate stays the current target, and the drone gets pulled back through it
+        (the loop-back-through-an-already-flown-gate bug). If the drone happens to approach from
+        the +x side, the motion primitives will route it around to cross in +x, which is exactly
+        what the race rules demand. Only when orientations are unavailable do we fall back to a
+        geometric estimate (best effort; the controller always supplies orientations).
+        """
         normals = []
         prev = start_pos
         for i, c in enumerate(centers):
             if gate_rpys is not None:
                 yaw = float(np.asarray(gate_rpys, float).reshape(-1, 3)[i, 2])
-                nrm = np.array([np.cos(yaw), np.sin(yaw), 0.0])
-                # Orient along travel direction (away from where we came from).
-                if np.dot(c - prev, nrm) < 0:
-                    nrm = -nrm
+                nrm = np.array([np.cos(yaw), np.sin(yaw), 0.0])  # gate +x = required crossing dir
             else:
                 nxt = centers[i + 1] if i + 1 < len(centers) else c + (c - prev)
                 nrm = nxt - prev
