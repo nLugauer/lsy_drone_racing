@@ -328,18 +328,43 @@ class AttitudeMPC(Controller):
         self.last_solver_status = 0
 
         self._obstacle_manager = ObstacleManager(safety_margin=0.14)
-        gate_positions = np.array([g["pos"] for g in config.env.track.gates])
-        gate_rpys = np.array([g["rpy"] for g in config.env.track.gates])
-        for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
-            self._obstacle_manager.add_gate(gate_pos, gate_rpy)
 
-        if hasattr(config.env.track, "obstacles") and config.env.track.obstacles:
-            for pole_pos in config.env.track.obstacles:
-                self._obstacle_manager.add_pole(pole_pos)
+        # Resolve the initial track layout. Two separate cases, because level 3 hides the real
+        # layout from the config file:
+        #   * Levels 0-2 (config.env.track.randomize == False): the config holds the real nominal
+        #     gate/obstacle positions, so read them from the config (original behavior).
+        #   * Level 3 (randomize == True): the env fully regenerates the track per reset and the
+        #     config positions are just origin placeholders. The actual randomized layout (already
+        #     in visit order) is delivered through the reset observation, so read it from obs. The
+        #     order is fixed (target_gate), so no reordering is needed. Without this, the first
+        #     plan is built through gates stacked at the origin -> a degenerate path that ignores
+        #     the true gate order.
+        self._randomized_track = bool(getattr(config.env.track, "randomize", False))
+        if not self._randomized_track:
+            # ---- Levels 0-2: layout comes from the config (unchanged) ----
+            gate_positions = np.array([g["pos"] for g in config.env.track.gates])
+            gate_rpys = np.array([g["rpy"] for g in config.env.track.gates])
+            for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
+                self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+
+            if hasattr(config.env.track, "obstacles") and config.env.track.obstacles:
+                for pole_pos in config.env.track.obstacles:
+                    self._obstacle_manager.add_pole(pole_pos)
+
+            gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
+            gate_rpys = np.array([g["rpy"] for g in config.env.track.gates], dtype=np.float64)
+        else:
+            # ---- Level 3: layout comes from the reset observation (config is placeholders) ----
+            gate_positions = np.array(obs["gates_pos"], dtype=np.float64)
+            gate_rpys = R.from_quat(np.array(obs["gates_quat"], dtype=np.float64)).as_euler("xyz")
+            for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
+                self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+
+            if "obstacles_pos" in obs:
+                for pole_pos in np.array(obs["obstacles_pos"], dtype=np.float64):
+                    self._obstacle_manager.add_pole(pole_pos)
 
         start_pos = np.array(obs["pos"], dtype=np.float64)
-        gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
-        gate_rpys = np.array([g["rpy"] for g in config.env.track.gates], dtype=np.float64)
         self._gate_rpys = gate_rpys.copy()
         self._gates_visited_flags = np.zeros(len(gate_positions), dtype=bool)
         if self.USE_PMM_PLANNER:
