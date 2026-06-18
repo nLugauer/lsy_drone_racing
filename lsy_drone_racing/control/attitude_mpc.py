@@ -367,6 +367,18 @@ class AttitudeMPC(Controller):
         start_pos = np.array(obs["pos"], dtype=np.float64)
         self._gate_rpys = gate_rpys.copy()
         self._gates_visited_flags = np.zeros(len(gate_positions), dtype=bool)
+
+        # ===================== TEMP DEBUG (level3 diagnosis) =====================
+        # Remove once we've confirmed where the origin-squiggle gates come from. This
+        # prints whether the level3 branch was taken and what gate positions were
+        # actually read at reset vs. what gets fed to the planner.
+        np.set_printoptions(precision=3, suppress=True)
+        print("[L3-DEBUG] randomize flag (self._randomized_track) =", self._randomized_track)
+        print("[L3-DEBUG] obs['gates_pos'] at reset =\n", np.array(obs.get("gates_pos")))
+        print("[L3-DEBUG] gate_positions fed to planner =\n", gate_positions)
+        print("[L3-DEBUG] start_pos =", start_pos, " target_gate =", obs.get("target_gate"))
+        # =================== END TEMP DEBUG (level3 diagnosis) ==================
+
         if self.USE_PMM_PLANNER:
             # PMM planner: builds a near time-optimal racing line (Foehn et al. 2021, Sec. VI),
             # then refits it as an arc-length cubic spline with the same API as TrajectoryPlanner.
