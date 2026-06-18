@@ -260,6 +260,22 @@ class ObstacleManager:
             self.obstacles[pole_idx]["p1"] = start_point
             self.obstacles[pole_idx]["p2"] = end_point
 
+    def snapshot(self) -> ObstacleManager:
+        """Return a frozen, independent copy for thread-safe collision queries.
+
+        The control thread updates obstacle positions every tick (update_gate_positions /
+        update_pole_positions), while the background PMM replanner reads them through
+        points_in_obstacles. Handing the planner this copy lets it see a consistent set of
+        positions while it runs off the control thread. Only the geometry needed by
+        points_in_obstacles is copied (type, endpoints, radius, margin).
+        """
+        snap = ObstacleManager(safety_margin=self.safety_margin)
+        snap.obstacles = [
+            {"type": o["type"], "p1": o["p1"].copy(), "p2": o["p2"].copy(), "r": float(o["r"])}
+            for o in self.obstacles
+        ]
+        return snap
+
     def points_in_obstacles(self, points: np.ndarray, margin: float | None = None) -> np.ndarray:
         """Return boolean mask of points intersecting obstacles (with margin).
 

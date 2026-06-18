@@ -27,6 +27,7 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.obstacle_manager import ObstacleManager
+from lsy_drone_racing.control.point_mass_planner import AsyncPMMReplanner, PointMassPlanner
 from lsy_drone_racing.control.trajectory_planner import TrajectoryPlanner
 
 if TYPE_CHECKING:
@@ -203,8 +204,10 @@ def create_ocp_solver(
 
     # Set initial references.
     yref = np.zeros((ny,))
-    # Reference for v_theta (index 8) to a high target speed.
-    yref[8] = 15.0
+    # The solver minimizes (v_theta - target)^2, pushing the drone toward the target speed.
+    # Set to match the v_θ state constraint upper bound so the incentive is always active
+    # but the constraint prevents physically unreachable commands.
+    yref[8] = 3.0
     # Prevent the optimizer from collapsing thrust to zero by targeting hover thrust.
     yref[7] = parameters["mass"] * np.linalg.norm(parameters["gravity_vec"])
     ocp.cost.yref = yref
@@ -216,13 +219,13 @@ def create_ocp_solver(
     ocp.model.cost_y_expr_e = ocp.model.cost_y_expr_e
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5, 0.0])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5, 10.0])
+    ocp.constraints.lbx = np.array([-0.5, -0.5, -1.0, 0.0])
+    ocp.constraints.ubx = np.array([0.5, 0.5, 1.0, 3.0])   # v_θ capped at 3 m/s
     ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, 0.01])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 10.0])
+    ocp.constraints.lbu = np.array([-0.5, -0.5, -1.0, parameters["thrust_min"] * 4, 0.01])
+    ocp.constraints.ubu = np.array([0.5, 0.5, 1.0, parameters["thrust_max"] * 4, 3.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -292,6 +295,12 @@ def create_ocp_solver(
 class AttitudeMPC(Controller):
     """Example of a MPC using the collective thrust and attitude interface."""
 
+    # Reference path source. True -> PMM sampling planner (point_mass_planner.py);
+    # False -> the original chord-length cubic spline (trajectory_planner.py). Both expose
+    # the same public API, so the rest of this controller is identical either way. Kept as a
+    # toggle for A/B lap-time comparison.
+    USE_PMM_PLANNER = True
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
 
@@ -328,13 +337,30 @@ class AttitudeMPC(Controller):
             for pole_pos in config.env.track.obstacles:
                 self._obstacle_manager.add_pole(pole_pos)
 
-        # start_pos = obs["pos"]
-        # None for hardcoded trajectory; gate_positions and start_pos for gates as waypoints
-        self._trajectory = TrajectoryPlanner(start_pos=None, gates_pos=None)
+        start_pos = np.array(obs["pos"], dtype=np.float64)
+        gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
+        gate_rpys = np.array([g["rpy"] for g in config.env.track.gates], dtype=np.float64)
+        self._gate_rpys = gate_rpys.copy()
+        self._gates_visited_flags = np.zeros(len(gate_positions), dtype=bool)
+        if self.USE_PMM_PLANNER:
+            # PMM planner: builds a near time-optimal racing line (Foehn et al. 2021, Sec. VI),
+            # then refits it as an arc-length cubic spline with the same API as TrajectoryPlanner.
+            # v_max is kept consistent with the MPCC's v_theta cap; the planner emits geometry
+            # only (no timing) and reads obstacles for graph-edge collision pruning.
+            self._trajectory = PointMassPlanner(
+                start_pos=start_pos,
+                gates_pos=gate_positions,
+                gate_rpys=gate_rpys,
+                start_vel=np.array(obs["vel"], dtype=np.float64),
+                obstacle_manager=self._obstacle_manager,
+                u_max=10.0,
+                v_max=3.0,
+            )
+        else:
+            self._trajectory = TrajectoryPlanner(
+                start_pos=start_pos, gates_pos=gate_positions, gate_rpys=gate_rpys
+            )
 
-        # ------------------------------------------------------------------
-        # PARAMETER CONFIGURATION LOADING SYSTEM
-        # ------------------------------------------------------------------
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         mpcc_params = {}
 
@@ -405,6 +431,22 @@ class AttitudeMPC(Controller):
         self._config = config
         self._finished = False
         self._last_thrust = self.drone_params["mass"] * 9.81  # Track thrust state for next tick
+        self._last_u0 = np.array([0.0, 0.0, 0.0, self._last_thrust])  # Fallback on QP failure
+        self._needs_warm_start_reset = False
+
+        # --- Phase 4: asynchronous PMM replanning state (PMM planner only) ---
+        # In level 2 each gate's true position is revealed (obs["gates_pos"] switches from
+        # nominal to real) once the drone comes within sensor range. We replan the PMM whenever
+        # that observed position changes, but OFF the control thread so the 50 Hz loop never
+        # stalls on the ~150 ms plan. We remember the gate positions baked into the current plan
+        # to detect such changes.
+        self._replanner = AsyncPMMReplanner() if self.USE_PMM_PLANNER else None
+        self._planned_gates_pos = gate_positions.copy()  # gate positions used by the live plan
+        self._planned_target = 0  # target-gate index at the last replan
+        # Receding horizon: plan through this many gates ahead of the current target. Defaults to
+        # all gates (cheap on this short track); lower it for long courses (paper Sec. VI-B).
+        self._planning_horizon = len(gate_positions)
+        self._replan_gate_move = 0.08  # [m] observed gate shift that triggers a replan
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -413,6 +455,7 @@ class AttitudeMPC(Controller):
         if info is not None:
             gates_pos = None
             gates_yaw = None
+            gates_rpys = None
             if "gates_pos" in info:
                 gates_pos = np.array(info["gates_pos"], dtype=np.float64)
             elif "gates_pos" in obs:
@@ -438,6 +481,21 @@ class AttitudeMPC(Controller):
             if obstacles_pos is not None:
                 self._obstacle_manager.update_pole_positions(obstacles_pos)
 
+            # Replan when a gate's observed position changes — i.e. its true position was just
+            # revealed (obs["gates_pos"] switches nominal->real once within the 0.7 m sensor
+            # range) or refined. Without replanning, the nominal path can sit up to 0.15 m off
+            # the true center in Level 2, leaving only 0.05 m clearance — a near-certain crash.
+            # The PMM planner replans OFF the control thread (Phase 4) so the 50 Hz loop never
+            # stalls; the legacy spline planner keeps its original synchronous rebuild.
+            if gates_pos is not None:
+                if self.USE_PMM_PLANNER:
+                    replan_rpys = gates_rpys if gates_yaw is not None else None
+                    self._maybe_replan_pmm(obs, gates_pos, replan_rpys)
+                elif "gates_visited" in obs:
+                    self._legacy_rebuild(obs, gates_pos)
+
+        # Define the terminal condition:
+        # The environment sets target_gate to -1 exactly when the final gate plane is crossed.
         if "target_gate" in obs and int(obs["target_gate"]) == -1:
             self._finished = True
 
@@ -454,7 +512,7 @@ class AttitudeMPC(Controller):
 
         yref_target = np.zeros((self._ny,))
         yref_target[7] = self.drone_params["mass"] * 9.81  # Hover thrust
-        yref_target[8] = 15.0  # Target progress speed (v_theta)
+        yref_target[8] = 3.0  # Target progress speed (v_theta), matches state constraint upper bound
 
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref_target)
@@ -466,12 +524,17 @@ class AttitudeMPC(Controller):
         num_obs = len(self._obstacle_manager.obstacles)
         total_params = 14 + (6 * num_obs)
 
+        # Set spline parameter guess stage-by-stage using predicted theta.
+        use_kinematic_guess = self._tick == 0 or self._needs_warm_start_reset
         for j in range(self._N):
-            if self._tick == 0:
-                theta_pred = self._current_theta + j * self._dt * 2.0
+            if use_kinematic_guess:
+                # Provide a kinematic guess on first tick and after any trajectory rebuild.
+                # After a rebuild the old solution has theta values from the OLD path, which
+                # are inconsistent with the new spline and would corrupt the MPC parameters.
+                theta_pred = self._current_theta + j * self._dt * max(self._current_v_theta, 0.5)
                 xj_guess = x0_aug.copy()
                 xj_guess[13] = theta_pred
-                xj_guess[14] = 2.0
+                xj_guess[14] = max(self._current_v_theta, 0.5)
                 hover_u = np.array([0.0, 0.0, 0.0, self.drone_params["mass"] * 9.81, 0.0])
                 self._acados_ocp_solver.set(j, "x", xj_guess)
                 self._acados_ocp_solver.set(j, "u", hover_u)
@@ -499,9 +562,39 @@ class AttitudeMPC(Controller):
 
             self._acados_ocp_solver.set(j, "p", params_j)
 
-        self._acados_ocp_solver.set(self._N, "p", params_j)
+            # Phase 4b: steer the progress speed v_theta toward the PMM's time-optimal speed
+            # at this point on the path (fast on straights, slower into tight turns) instead of
+            # the constant target above. Only the PMM planner exposes a speed profile; the
+            # legacy spline keeps the constant target. Clip to the v_theta state bound (= 3 m/s).
+            if self.USE_PMM_PLANNER:
+                yref_j = yref_target.copy()
+                yref_j[8] = float(np.clip(self._trajectory.evaluate_speed(theta_pred), 0.1, yref_target[8]))
+                self._acados_ocp_solver.set(j, "yref", yref_j)
 
-        self.last_solver_status = self._acados_ocp_solver.solve()
+        # Set parameters for the terminal node (N): extrapolate theta one more step
+        xN_prev = self._acados_ocp_solver.get(self._N, "x")
+        theta_N = float(np.clip(xN_prev[13], self._trajectory.knot_points[0], self._trajectory.knot_points[-1]))
+        px_N, py_N, pz_N, theta_offset_N = self._trajectory.get_polynomial_coeffs_at(theta_N)
+        pos_N = self._trajectory.evaluate(theta_N)
+        q_c_N = self._obstacle_manager.dynamic_contour_weight(pos_N)
+        params_N = np.zeros((total_params,))
+        params_N[0:4] = px_N.flatten()
+        params_N[4:8] = py_N.flatten()
+        params_N[8:12] = pz_N.flatten()
+        params_N[12] = q_c_N
+        params_N[13] = theta_offset_N
+        params_N[14:] = obs_params
+        self._acados_ocp_solver.set(self._N, "p", params_N)
+
+        # Solve and extract first control. We run the RTI solver to meet 50 Hz real-time.
+        status = self._acados_ocp_solver.solve()
+        self._needs_warm_start_reset = False
+
+        if status != 0:
+            # QP solver failed (e.g. status 3 = NaN, status 1 = max iter). Fall back to the
+            # last known-good command and force a fresh warm start next step.
+            self._needs_warm_start_reset = True
+            return self._last_u0.copy()
 
         for j in range(self._N):
             xj = self._acados_ocp_solver.get(j, "x")
@@ -513,7 +606,8 @@ class AttitudeMPC(Controller):
         self._current_v_theta = float(x1_opt[14])
 
         u0 = u0_aug[0:4]
-        self._last_thrust = float(u0[3])
+        self._last_thrust = float(u0[3])  # Save thrust command for next tick
+        self._last_u0 = u0.copy()
 
         p_curr = obs["pos"]
         p_ref = self._trajectory.evaluate(self._current_theta)
@@ -535,8 +629,115 @@ class AttitudeMPC(Controller):
         self._log_v_theta.append(self._current_v_theta)
         self._log_q_c.append(float(q_c_current))
 
-        self._tick += 1
         return u0
+
+    def _maybe_replan_pmm(
+        self,
+        obs: dict[str, NDArray[np.floating]],
+        gates_pos: NDArray[np.floating],
+        gates_rpys: NDArray[np.floating] | None,
+    ) -> None:
+        """Phase 4: off-thread PMM replanning driven by new gate data.
+
+        Each tick this (1) swaps in a finished background plan if one is ready, and (2) starts a
+        new background plan when a gate's observed position has changed (its true position was
+        just revealed/refined) or the target gate advanced. Planning runs on a worker thread, so
+        the 50 Hz control loop never blocks; the drone keeps flying on the current plan until the
+        new one is ready. Meanwhile the obstacle manager is updated synchronously every tick, so
+        collision avoidance already uses the true gate positions — only the reference centerline
+        lags by the (~150 ms) planning time.
+
+        Args:
+            obs: Current observation (uses pos, vel, target_gate).
+            gates_pos: (N, 3) currently observed gate positions (nominal until revealed).
+            gates_rpys: (N, 3) observed gate orientations, or None to derive normals from geometry.
+        """
+        # (1) Adopt a finished background plan, if any, and re-anchor the progress state to it.
+        new_planner = self._replanner.take()
+        if new_planner is not None:
+            self._trajectory = new_planner
+            self._reanchor_progress(obs)
+            self._needs_warm_start_reset = True  # the previous warm start was for the old path
+
+        target = int(obs.get("target_gate", 0))
+        if target < 0:
+            return  # final gate passed; nothing left to plan
+
+        # (2) Replan trigger: a gate within the planning window moved beyond the threshold (a
+        # nominal->real reveal is a large jump), or we passed a gate (target advanced), which
+        # recedes the horizon forward.
+        window = slice(target, min(target + self._planning_horizon, len(gates_pos)))
+        moved = 0.0
+        if window.stop > window.start:
+            moved = float(
+                np.max(np.linalg.norm(gates_pos[window] - self._planned_gates_pos[window], axis=1))
+            )
+        if not (target != self._planned_target or moved > self._replan_gate_move):
+            return
+        if self._replanner.busy():
+            return  # a replan is already running; this trigger is re-checked next tick
+
+        # Capture snapshots on this (control) thread so the worker reads no shared mutable state.
+        start_pos = np.array(obs["pos"], dtype=np.float64)
+        start_vel = np.array(obs["vel"], dtype=np.float64)
+        horizon_gates = np.array(gates_pos[window], dtype=np.float64)
+        horizon_rpys = (
+            np.array(gates_rpys[window], dtype=np.float64) if gates_rpys is not None else None
+        )
+        obs_snapshot = self._obstacle_manager.snapshot()
+        planner = self._trajectory  # captured by the closure; _spawn reuses its tuning
+        self._replanner.request(
+            lambda: planner._spawn(start_pos, horizon_gates, horizon_rpys, start_vel, obs_snapshot)
+        )
+
+        # Record what the in-flight plan is based on so the same data does not re-trigger it.
+        self._planned_gates_pos = np.array(gates_pos, dtype=np.float64)
+        self._planned_target = target
+
+    def _reanchor_progress(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Re-fit the progress state (theta, v_theta) to the current trajectory after a swap.
+
+        theta is set to the arc length of the path point nearest the drone; v_theta to the
+        drone's real velocity projected onto the new path tangent (a retained v_theta could be
+        misaligned with the new path direction).
+        """
+        self._current_theta = float(
+            np.clip(
+                self._trajectory.nearest_theta(obs["pos"]),
+                self._trajectory.knot_points[0],
+                self._trajectory.knot_points[-1],
+            )
+        )
+        t_new = self._trajectory.evaluate_velocity(self._current_theta)
+        t_norm = t_new / (np.linalg.norm(t_new) + 1e-6)
+        v_proj = float(np.dot(np.array(obs["vel"], dtype=np.float64), t_norm))
+        self._current_v_theta = max(0.01, v_proj)
+
+    def _legacy_rebuild(
+        self, obs: dict[str, NDArray[np.floating]], gates_pos: NDArray[np.floating]
+    ) -> None:
+        """Synchronous rebuild for the non-PMM spline planner (original behavior).
+
+        Rebuilds the reference path through the revealed gate centers the first time any gate
+        enters sensor range, then re-anchors the progress state. Used only when
+        USE_PMM_PLANNER is False.
+        """
+        gates_visited_now = np.array(obs["gates_visited"], dtype=bool)
+        if not np.any(gates_visited_now & ~self._gates_visited_flags):
+            return
+        # Only gates from the current target onwards, to avoid routing the path backwards
+        # through a gate we just passed.
+        target_gate_idx = int(obs.get("target_gate", 0))
+        if 0 <= target_gate_idx < len(gates_pos):
+            remaining_gates = gates_pos[target_gate_idx:]
+        else:
+            remaining_gates = gates_pos[-1:]
+        # No approach waypoints mid-flight: the drone is already close, so a 0.3 m offset point
+        # could land behind it and kink the path.
+        self._trajectory.rebuild(obs["pos"], remaining_gates, gate_rpys=None)
+        self._reanchor_progress(obs)
+        self._gates_visited_flags = gates_visited_now.copy()
+        self._needs_warm_start_reset = True
 
     def render_callback(self, sim: Sim):
         """Visualize the reference path, current MPCC target, predicted horizon, and obstacles."""

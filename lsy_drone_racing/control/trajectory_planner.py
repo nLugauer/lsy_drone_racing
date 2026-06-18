@@ -17,11 +17,43 @@ class TrajectoryPlanner:
         self,
         start_pos: np.ndarray | None = None,
         gates_pos: np.ndarray | None = None,
+        gate_rpys: np.ndarray | None = None,
         n_eval_points: int = 500,
         min_z: float = 0.15,
+        gate_approach_dist: float = 0.3,
     ) -> None:
-        """Build the spline from start pos + gates, ensuring ground clearance."""
-        # 1. Handle fallback to hardcoded waypoints if gates_pos is None
+        """Build the spline from start pos + gates, ensuring ground clearance.
+
+        Args:
+            start_pos: Drone start position [x, y, z].
+            gates_pos: (N, 3) gate center positions. If None, uses hardcoded waypoints.
+            gate_rpys: (N, 3) gate orientations [roll, pitch, yaw]. Used to inject
+                pre/post-gate approach waypoints for perpendicular gate traversal.
+            n_eval_points: Resolution of the precomputed path sample array.
+            min_z: Minimum z height for ground clearance injection.
+            gate_approach_dist: Distance in front of / behind each gate for approach waypoints.
+        """
+        self._n_eval_points = n_eval_points
+        self._min_z = min_z
+        self._gate_approach_dist = gate_approach_dist
+
+        waypoints = self._build_waypoints(start_pos, gates_pos, gate_rpys)
+
+        # Build the spline with ground-clearance checks
+        self._s, self._des_pos_spline = self._build_safe_spline(waypoints, min_z)
+        self._s_total = float(self._s[-1])
+
+        # Precompute derivatives and fine evaluation points
+        self._des_vel_spline = self._des_pos_spline.derivative()
+        self._waypoints_pos = self._des_pos_spline(np.linspace(0, self._s_total, n_eval_points))
+
+    def _build_waypoints(
+        self,
+        start_pos: np.ndarray | None,
+        gates_pos: np.ndarray | None,
+        gate_rpys: np.ndarray | None,
+    ) -> np.ndarray:
+        """Construct the ordered waypoint list, optionally with gate approach vectors."""
         if gates_pos is None:
             waypoints = np.array(
                 [
@@ -39,16 +71,87 @@ class TrajectoryPlanner:
             )
             if start_pos is not None:
                 waypoints = np.vstack((start_pos, waypoints))
+            return waypoints
+
+        # Build waypoints from gate centers, optionally with approach vectors
+        pts = [np.array(start_pos, dtype=np.float64)]
+
+        for i, gate_pos in enumerate(gates_pos):
+            gate_pos = np.array(gate_pos, dtype=np.float64)
+
+            if gate_rpys is not None:
+                yaw = float(gate_rpys[i, 2])
+                # Gate normal points along the gate's local X axis after yaw rotation
+                normal = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+
+                # Determine approach side: which side of the gate are we coming from?
+                prev_pt = pts[-1]
+                to_gate = gate_pos - prev_pt
+                if np.dot(to_gate, normal) >= 0:
+                    # Approaching from the negative-normal side
+                    pre_gate = gate_pos - self._gate_approach_dist * normal
+                    post_gate = gate_pos + self._gate_approach_dist * normal
+                else:
+                    # Approaching from the positive-normal side
+                    pre_gate = gate_pos + self._gate_approach_dist * normal
+                    post_gate = gate_pos - self._gate_approach_dist * normal
+
+                pts.append(pre_gate)
+                pts.append(gate_pos)
+                pts.append(post_gate)
+            else:
+                pts.append(gate_pos)
+
+        # Add a continuation waypoint 0.5m past the last gate to prevent the optimizer
+        # from stalling at the spline endpoint during the MPC horizon.
+        if len(gates_pos) >= 2:
+            direction = np.array(gates_pos[-1]) - np.array(gates_pos[-2])
+            direction = direction / (np.linalg.norm(direction) + 1e-6)
         else:
-            waypoints = np.vstack((start_pos, gates_pos))
+            direction = np.array([1.0, 0.0, 0.0])
+        pts.append(np.array(gates_pos[-1]) + 0.5 * direction)
 
-        # 2. Build the spline with ground-clearance checks
-        self._s, self._des_pos_spline = self._build_safe_spline(waypoints, min_z)
+        return np.array(pts, dtype=np.float64)
+
+    def rebuild(
+        self,
+        start_pos: np.ndarray,
+        gates_pos: np.ndarray,
+        gate_rpys: np.ndarray | None = None,
+    ) -> None:
+        """Rebuild the spline in-place with updated gate positions.
+
+        Call this when a gate's true position becomes known. The trajectory object
+        is updated and all subsequent evaluate() / get_polynomial_coeffs_at() calls
+        will use the new spline. Theta values from the previous spline are invalid
+        after this call — use nearest_theta() to re-initialize.
+
+        Args:
+            start_pos: Current drone position used as spline anchor.
+            gates_pos: (N, 3) updated gate positions (mix of nominal and true).
+            gate_rpys: (N, 3) gate orientations. Pass None to skip approach waypoints.
+        """
+        waypoints = self._build_waypoints(start_pos, gates_pos, gate_rpys)
+        self._s, self._des_pos_spline = self._build_safe_spline(waypoints, self._min_z)
         self._s_total = float(self._s[-1])
-
-        # 3. Precompute derivatives and fine evaluation points
         self._des_vel_spline = self._des_pos_spline.derivative()
-        self._waypoints_pos = self._des_pos_spline(np.linspace(0, self._s_total, n_eval_points))
+        self._waypoints_pos = self._des_pos_spline(
+            np.linspace(0, self._s_total, self._n_eval_points)
+        )
+
+    def nearest_theta(self, pos: np.ndarray) -> float:
+        """Return the arc-length parameter of the path point nearest to pos.
+
+        Use this to re-initialize _current_theta after a trajectory rebuild.
+
+        Args:
+            pos: World-space position [x, y, z].
+
+        Returns:
+            Arc-length parameter in [0, total_length].
+        """
+        idx = self.get_nearest_waypoint_index(pos)
+        return float(self._s_total * idx / max(self._n_eval_points - 1, 1))
 
     def _build_safe_spline(
         self, waypoints: np.ndarray, min_z: float
