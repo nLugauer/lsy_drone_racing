@@ -652,14 +652,23 @@ class AttitudeMPC(Controller):
             gates_pos: (N, 3) currently observed gate positions (nominal until revealed).
             gates_rpys: (N, 3) observed gate orientations, or None to derive normals from geometry.
         """
-        # (1) Adopt a finished background plan, if any, and re-anchor the progress state to it.
+        target = int(obs.get("target_gate", 0))
+
+        # (1) Adopt a finished background plan — but only if it is NOT stale. Every plan is built
+        # through gates[target:], i.e. starting at the gate the drone was flying toward when the
+        # request was issued (recorded in self._planned_target). A full plan takes ~150 ms, during
+        # which the drone may pass that gate (target advances). Swapping such a plan in would route
+        # the reference backwards through an already-passed gate and make the drone loop back
+        # through it. So we discard any plan whose starting gate has since been passed and keep
+        # flying forward on the current plan; the trigger below immediately requests a fresh plan
+        # from the new target (because target != self._planned_target). Passed gates still exist as
+        # obstacles in the ObstacleManager — they simply stop being reference waypoints.
         new_planner = self._replanner.take()
-        if new_planner is not None:
+        if new_planner is not None and target == self._planned_target:
             self._trajectory = new_planner
             self._reanchor_progress(obs)
             self._needs_warm_start_reset = True  # the previous warm start was for the old path
 
-        target = int(obs.get("target_gate", 0))
         if target < 0:
             return  # final gate passed; nothing left to plan
 
