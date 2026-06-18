@@ -342,42 +342,54 @@ class AttitudeMPC(Controller):
         self._randomized_track = bool(getattr(config.env.track, "randomize", False))
         if not self._randomized_track:
             # ---- Levels 0-2: layout comes from the config (unchanged) ----
-            gate_positions = np.array([g["pos"] for g in config.env.track.gates])
-            gate_rpys = np.array([g["rpy"] for g in config.env.track.gates])
-            for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
-                self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+            gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
+            gate_rpys = np.array([g["rpy"] for g in config.env.track.gates], dtype=np.float64)
 
             if hasattr(config.env.track, "obstacles") and config.env.track.obstacles:
                 for pole_pos in config.env.track.obstacles:
                     self._obstacle_manager.add_pole(pole_pos)
-
-            gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
-            gate_rpys = np.array([g["rpy"] for g in config.env.track.gates], dtype=np.float64)
         else:
-            # ---- Level 3: layout comes from the reset observation (config is placeholders) ----
-            gate_positions = np.array(obs["gates_pos"], dtype=np.float64)
-            gate_rpys = R.from_quat(np.array(obs["gates_quat"], dtype=np.float64)).as_euler("xyz")
-            for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
-                self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+            # ---- Level 3: the full randomized layout is delivered through the reset observation
+            # (the config holds only origin placeholders). Load ALL gate positions/orientations
+            # from the obs vector here, before takeoff, so PMM can plan one path through every
+            # gate in visit order. obs["gates_pos"] reports each gate's nominal position until the
+            # drone senses it within range (then it switches to the measured position); at reset
+            # that means the nominal randomized layout for every not-yet-seen gate. The per-gate
+            # online refinement afterwards is handled exactly as in level 2 by _maybe_replan_pmm.
+            gate_positions = np.array(obs["gates_pos"], dtype=np.float64).reshape(-1, 3)
+            gate_quats = np.array(obs["gates_quat"], dtype=np.float64).reshape(-1, 4)
+            gate_rpys = R.from_quat(gate_quats).as_euler("xyz")
 
             if "obstacles_pos" in obs:
-                for pole_pos in np.array(obs["obstacles_pos"], dtype=np.float64):
+                for pole_pos in np.array(obs["obstacles_pos"], dtype=np.float64).reshape(-1, 3):
                     self._obstacle_manager.add_pole(pole_pos)
 
-        start_pos = np.array(obs["pos"], dtype=np.float64)
+        # Register every gate as an obstacle/waypoint (same for all levels).
+        for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
+            self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+
+        # Persist the initial layout so the rest of the controller (PMM build, replanning
+        # bookkeeping) works off a single, explicit source of truth.
+        self._gate_positions = gate_positions.copy()
         self._gate_rpys = gate_rpys.copy()
         self._gates_visited_flags = np.zeros(len(gate_positions), dtype=bool)
 
-        # ===================== TEMP DEBUG (level3 diagnosis) =====================
-        # Remove once we've confirmed where the origin-squiggle gates come from. This
-        # prints whether the level3 branch was taken and what gate positions were
-        # actually read at reset vs. what gets fed to the planner.
-        np.set_printoptions(precision=3, suppress=True)
-        print("[L3-DEBUG] randomize flag (self._randomized_track) =", self._randomized_track)
-        print("[L3-DEBUG] obs['gates_pos'] at reset =\n", np.array(obs.get("gates_pos")))
-        print("[L3-DEBUG] gate_positions fed to planner =\n", gate_positions)
-        print("[L3-DEBUG] start_pos =", start_pos, " target_gate =", obs.get("target_gate"))
-        # =================== END TEMP DEBUG (level3 diagnosis) ==================
+        start_pos = np.array(obs["pos"], dtype=np.float64)
+
+        # Sanity guard: in a real randomized track the gates are spread out (>= ~1 m apart). If two
+        # or more loaded gate centers coincide in xy, the observation handed us origin placeholders
+        # instead of the real layout (e.g. the running env predates the level-3 obs fix), and any
+        # plan built now would squiggle at the origin. Surface that loudly instead of failing silently.
+        if len(gate_positions) > 1:
+            xy = gate_positions[:, :2]
+            dmat = np.linalg.norm(xy[:, None, :] - xy[None, :, :], axis=-1)
+            np.fill_diagonal(dmat, np.inf)
+            if float(dmat.min()) < 0.2:
+                print(
+                    "[WARN] AttitudeMPC: obs['gates_pos'] returned near-coincident gate centers "
+                    f"at reset -> the observation is not exposing the real level-3 layout.\n"
+                    f"       loaded gate xy =\n{np.array2string(gate_positions, precision=3)}"
+                )
 
         if self.USE_PMM_PLANNER:
             # PMM planner: builds a near time-optimal racing line (Foehn et al. 2021, Sec. VI),
