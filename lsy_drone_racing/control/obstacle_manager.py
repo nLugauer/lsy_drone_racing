@@ -31,7 +31,7 @@ class ObstacleManager:
         self._gate_obstacle_indices = []
         self._pole_obstacle_indices = []
         self._q_nom = 1.0
-        self._q_wp = 150.0
+        self._q_wp = 1000.0
         self._sigma_sq = 0.25**2
 
     def add_sphere(self, center: np.ndarray, radius: float) -> None:

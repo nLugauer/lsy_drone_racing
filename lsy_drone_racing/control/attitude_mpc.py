@@ -183,7 +183,7 @@ def create_ocp_solver(
     W_contour = parameters.get("Q_c", 20.0)
     W_lag = parameters.get("Q_l", 250.0)
     W_controls = parameters.get("R_u", 50.0)
-    W_progress = parameters.get("mu", 0.1)
+    W_progress = parameters.get("mu", 0.3)
     W_thrust = parameters.get("R_T", 250.0)
 
     W = np.zeros((ny, ny))
@@ -219,13 +219,13 @@ def create_ocp_solver(
     ocp.model.cost_y_expr_e = ocp.model.cost_y_expr_e
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -1.0, 0.0])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 1.0, 3.0])   # v_θ capped at 3 m/s
+    ocp.constraints.lbx = np.array([-1, -1, -1.0, 0.0])
+    ocp.constraints.ubx = np.array([1, 1, 1.0, 3.0])   # v_θ capped at 3 m/s
     ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -1.0, parameters["thrust_min"] * 4, 0.01])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 1.0, parameters["thrust_max"] * 4, 3.0])
+    ocp.constraints.lbu = np.array([-1, -1, -1.0, parameters["thrust_min"] * 4, 0.01])
+    ocp.constraints.ubu = np.array([1, 1, 1.0, parameters["thrust_max"] * 4, 3.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -311,7 +311,7 @@ class AttitudeMPC(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
-        self._N = 25
+        self._N = 33
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
@@ -351,16 +351,32 @@ class AttitudeMPC(Controller):
         else:
             # ---- Level 3: the full randomized layout is delivered through the reset observation
             # (the config holds only origin placeholders). Load ALL gate positions/orientations
-            # from the obs vector here, before takeoff, so PMM can plan one path through every
+            # from the obs/info vector here, before takeoff, so PMM can plan one path through every
             # gate in visit order. obs["gates_pos"] reports each gate's nominal position until the
             # drone senses it within range (then it switches to the measured position); at reset
             # that means the nominal randomized layout for every not-yet-seen gate. The per-gate
             # online refinement afterwards is handled exactly as in level 2 by _maybe_replan_pmm.
-            gate_positions = np.array(obs["gates_pos"], dtype=np.float64).reshape(-1, 3)
-            gate_quats = np.array(obs["gates_quat"], dtype=np.float64).reshape(-1, 4)
+            # Check info first (matches compute_control pattern), then obs, then fall back to config
+            if "gates_pos" in info:
+                gate_positions = np.array(info["gates_pos"], dtype=np.float64).reshape(-1, 3)
+            elif "gates_pos" in obs:
+                gate_positions = np.array(obs["gates_pos"], dtype=np.float64).reshape(-1, 3)
+            else:
+                gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
+
+            if "gates_quat" in info:
+                gate_quats = np.array(info["gates_quat"], dtype=np.float64).reshape(-1, 4)
+            elif "gates_quat" in obs:
+                gate_quats = np.array(obs["gates_quat"], dtype=np.float64).reshape(-1, 4)
+            else:
+                gate_quats = np.array([R.from_euler("xyz", g["rpy"]).as_quat() for g in config.env.track.gates], dtype=np.float64)
+            
             gate_rpys = R.from_quat(gate_quats).as_euler("xyz")
 
-            if "obstacles_pos" in obs:
+            if "obstacles_pos" in info:
+                for pole_pos in np.array(info["obstacles_pos"], dtype=np.float64).reshape(-1, 3):
+                    self._obstacle_manager.add_pole(pole_pos)
+            elif "obstacles_pos" in obs:
                 for pole_pos in np.array(obs["obstacles_pos"], dtype=np.float64).reshape(-1, 3):
                     self._obstacle_manager.add_pole(pole_pos)
 
@@ -510,6 +526,13 @@ class AttitudeMPC(Controller):
         # so adoption never jumps the MPCC's immediate reference. Smaller = more reactive to a
         # newly revealed gate; larger = smoother. Keep it below the sensor range (0.7 m).
         self._commit_distance = 0.5
+        # Minimum approach room [m] left in front of the target gate when committing the near-field
+        # on a replan. Must be large enough for the PMM to swing its velocity onto the gate's +x
+        # crossing direction after a position reveal. Too small (e.g. 0.1) forces the planner to
+        # re-thread a freshly revealed, laterally shifted gate within a fraction of a metre while
+        # still carrying near-full speed -> with bounded acceleration it overshoots and curls back,
+        # producing the visible loop right before the gate.
+        self._gate_approach_margin = 0.5
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -631,7 +654,7 @@ class AttitudeMPC(Controller):
             # legacy spline keeps the constant target. Clip to the v_theta state bound (= 3 m/s).
             if self.USE_PMM_PLANNER:
                 yref_j = yref_target.copy()
-                yref_j[8] = float(np.clip(self._trajectory.evaluate_speed(theta_pred), 0.1, yref_target[8]))
+                yref_j[8] = float(np.clip(self._trajectory.evaluate_speed(theta_pred), 3, yref_target[8]))
                 self._acados_ocp_solver.set(j, "yref", yref_j)
 
         # Set parameters for the terminal node (N): extrapolate theta one more step
@@ -734,13 +757,13 @@ class AttitudeMPC(Controller):
             # (below) this practically never triggers, but it guards the non-committed cases.
             vel = np.array(obs["vel"], dtype=np.float64)
             speed = float(np.linalg.norm(vel))
-            theta0 = float(
-                np.clip(
-                    new_planner.nearest_theta(obs["pos"]),
-                    new_planner.knot_points[0],
-                    new_planner.knot_points[-1],
-                )
-            )
+            # Evaluate the new plan's heading at its START knot, NOT at the global-nearest point.
+            # A plan can curve sharply near a freshly revealed gate; the global-nearest point may
+            # then land on the far leg of that curve and report a backward tangent, wrongly flagging
+            # a perfectly forward plan as "reversing" and trapping the drone on the stale, looping
+            # plan. The start knot is where the committed near-field begins, so its tangent always
+            # reflects the drone's actual direction of travel.
+            theta0 = float(new_planner.knot_points[0])
             tang = np.asarray(new_planner.evaluate_velocity(theta0), dtype=np.float64)
             tang_n = tang / (np.linalg.norm(tang) + 1e-9)
             reversing = speed > 0.3 and float(np.dot(tang_n, vel / speed)) < 0.0
@@ -779,7 +802,12 @@ class AttitudeMPC(Controller):
         theta_commit = min(theta_now + self._commit_distance, self._trajectory.total_length)
         theta_target = float(self._trajectory.nearest_theta(gates_pos[target]))
         if theta_target > theta_now:
-            theta_commit = min(theta_commit, theta_target - 0.1)  # don't commit past the target gate
+            # Stop committing well BEFORE the target gate, not right up against it. Leaving only
+            # ~0.1 m of approach forced the PMM to overshoot the freshly revealed gate and loop
+            # back to satisfy the +x crossing; a larger margin gives it room to align. If the
+            # drone is already inside this margin, theta_commit drops below theta_now and the
+            # branch below falls back to planning straight from the drone's real state.
+            theta_commit = min(theta_commit, theta_target - self._gate_approach_margin)
 
         committed_pts = None
         committed_speeds = None
