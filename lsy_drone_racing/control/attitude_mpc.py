@@ -505,6 +505,11 @@ class AttitudeMPC(Controller):
         # all gates (cheap on this short track); lower it for long courses (paper Sec. VI-B).
         self._planning_horizon = len(gate_positions)
         self._replan_gate_move = 0.08  # [m] observed gate shift that triggers a replan
+        # Robustness: commit the near-field on replans. A replan only changes the path BEYOND this
+        # look-ahead distance on the current trajectory; the segment in between is kept identical
+        # so adoption never jumps the MPCC's immediate reference. Smaller = more reactive to a
+        # newly revealed gate; larger = smoother. Keep it below the sensor range (0.7 m).
+        self._commit_distance = 0.5
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -723,9 +728,27 @@ class AttitudeMPC(Controller):
         # obstacles in the ObstacleManager — they simply stop being reference waypoints.
         new_planner = self._replanner.take()
         if new_planner is not None and target == self._planned_target:
-            self._trajectory = new_planner
-            self._reanchor_progress(obs)
-            self._needs_warm_start_reset = True  # the previous warm start was for the old path
+            # Reject a reversing plan (belt-and-suspenders): if the new path's initial tangent
+            # opposes the drone's current velocity, adopting it would yank the reference backward
+            # (large mismatch -> crash). Only meaningful while moving. With near-field committing
+            # (below) this practically never triggers, but it guards the non-committed cases.
+            vel = np.array(obs["vel"], dtype=np.float64)
+            speed = float(np.linalg.norm(vel))
+            theta0 = float(
+                np.clip(
+                    new_planner.nearest_theta(obs["pos"]),
+                    new_planner.knot_points[0],
+                    new_planner.knot_points[-1],
+                )
+            )
+            tang = np.asarray(new_planner.evaluate_velocity(theta0), dtype=np.float64)
+            tang_n = tang / (np.linalg.norm(tang) + 1e-9)
+            reversing = speed > 0.3 and float(np.dot(tang_n, vel / speed)) < 0.0
+            if not reversing:
+                self._trajectory = new_planner
+                self._reanchor_progress(obs)
+                self._needs_warm_start_reset = True  # previous warm start was for the old path
+            # else: discard the reversing plan and keep flying the current (forward) plan
 
         if target < 0:
             return  # final gate passed; nothing left to plan
@@ -744,9 +767,37 @@ class AttitudeMPC(Controller):
         if self._replanner.busy():
             return  # a replan is already running; this trigger is re-checked next tick
 
+        # Commit the near-field: the replan changes the path only BEYOND a short look-ahead on
+        # the CURRENT trajectory. We start the new plan at the commit point (commit_distance ahead
+        # of the drone's current progress) and prepend the segment in between, so the MPCC's
+        # immediate reference is identical before and after adoption -> no jump. The commit point
+        # is also kept short of the current target gate, otherwise the far plan could route back
+        # to it. If there is no meaningful near-field to commit (start of run, near the path end,
+        # or already past the target on this path), we fall back to planning from the drone.
+        knots = self._trajectory.knot_points
+        theta_now = float(np.clip(self._current_theta, knots[0], knots[-1]))
+        theta_commit = min(theta_now + self._commit_distance, self._trajectory.total_length)
+        theta_target = float(self._trajectory.nearest_theta(gates_pos[target]))
+        if theta_target > theta_now:
+            theta_commit = min(theta_commit, theta_target - 0.1)  # don't commit past the target gate
+
+        committed_pts = None
+        committed_speeds = None
+        if theta_commit - theta_now > 0.05:
+            s_pre = np.linspace(theta_now, theta_commit, 12)
+            committed_pts = np.asarray(self._trajectory.evaluate(s_pre), dtype=np.float64)
+            committed_speeds = np.array(
+                [float(self._trajectory.evaluate_speed(float(s))) for s in s_pre], dtype=np.float64
+            )
+            start_pos = committed_pts[-1].copy()  # new plan starts at the commit point
+            tang = np.asarray(self._trajectory.evaluate_velocity(theta_commit), dtype=np.float64)
+            tang_n = tang / (np.linalg.norm(tang) + 1e-9)
+            start_vel = tang_n * float(self._trajectory.evaluate_speed(theta_commit))
+        else:
+            start_pos = np.array(obs["pos"], dtype=np.float64)
+            start_vel = np.array(obs["vel"], dtype=np.float64)
+
         # Capture snapshots on this (control) thread so the worker reads no shared mutable state.
-        start_pos = np.array(obs["pos"], dtype=np.float64)
-        start_vel = np.array(obs["vel"], dtype=np.float64)
         horizon_gates = np.array(gates_pos[window], dtype=np.float64)
         horizon_rpys = (
             np.array(gates_rpys[window], dtype=np.float64) if gates_rpys is not None else None
@@ -754,7 +805,10 @@ class AttitudeMPC(Controller):
         obs_snapshot = self._obstacle_manager.snapshot()
         planner = self._trajectory  # captured by the closure; _spawn reuses its tuning
         self._replanner.request(
-            lambda: planner._spawn(start_pos, horizon_gates, horizon_rpys, start_vel, obs_snapshot)
+            lambda: planner._spawn(
+                start_pos, horizon_gates, horizon_rpys, start_vel, obs_snapshot,
+                committed_pts=committed_pts, committed_speeds=committed_speeds,
+            )
         )
 
         # Record what the in-flight plan is based on so the same data does not re-trigger it.

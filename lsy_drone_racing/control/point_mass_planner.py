@@ -448,6 +448,8 @@ class PointMassPlanner:
         min_z: float = 0.15,
         tail_extension: float = 0.5,
         seed: int = 0,
+        committed_pts: np.ndarray | None = None,
+        committed_speeds: np.ndarray | None = None,
     ) -> None:
         self._u_max = np.full(3, float(u_max)) if np.isscalar(u_max) else np.asarray(u_max, float)
         # v_max is the maximum SPEED (velocity norm). It is used both as the per-axis velocity
@@ -475,7 +477,7 @@ class PointMassPlanner:
             tail_extension=self._tail, seed=self._seed,
         )
 
-        self.plan(start_pos, gates_pos, gate_rpys, start_vel)
+        self.plan(start_pos, gates_pos, gate_rpys, start_vel, committed_pts, committed_speeds)
 
     # -- planning -------------------------------------------------------------------------
     def plan(
@@ -484,8 +486,24 @@ class PointMassPlanner:
         gates_pos: np.ndarray,
         gate_rpys: np.ndarray | None = None,
         start_vel: np.ndarray | None = None,
+        committed_pts: np.ndarray | None = None,
+        committed_speeds: np.ndarray | None = None,
     ) -> None:
-        """Run the PMM graph search and build the arc-length spline."""
+        """Run the PMM graph search and build the arc-length spline.
+
+        ``committed_pts`` / ``committed_speeds`` (optional) are a near-field prefix taken from the
+        previously-active trajectory. When supplied, ``start_pos`` is the END of that prefix and
+        the prefix is prepended to the new path, so the segment the MPCC is already tracking stays
+        continuous across the replan (no reference jump). See AttitudeMPC._maybe_replan_pmm.
+        """
+        self._committed_pts = (
+            None if committed_pts is None
+            else np.asarray(committed_pts, dtype=np.float64).reshape(-1, 3)
+        )
+        self._committed_speeds = (
+            None if committed_speeds is None
+            else np.asarray(committed_speeds, dtype=np.float64).reshape(-1)
+        )
         start_pos = np.asarray(start_pos, dtype=np.float64)
         gates_pos = np.asarray(gates_pos, dtype=np.float64).reshape(-1, 3)
 
@@ -582,14 +600,26 @@ class PointMassPlanner:
         as ``self._speed_profile``. For an arc-length path |v| equals ds/dt, i.e. exactly the
         progress speed v_theta the MPCC should target, so it is exported via evaluate_speed().
         """
-        # Dense samples of position and speed along the concatenated primitives.
+        # Dense samples of position and speed. Optionally begin with the committed near-field
+        # prefix (from the previously-active trajectory) so the path the MPCC is already tracking
+        # stays continuous across a replan; the PMM primitives only cover the part beyond it.
         pts: list[np.ndarray] = []
         spd: list[float] = []
+        has_prefix = self._committed_pts is not None and len(self._committed_pts) > 0
+        if has_prefix:
+            pts.extend(list(self._committed_pts))
+            if self._committed_speeds is not None and len(self._committed_speeds) == len(self._committed_pts):
+                spd.extend([float(s) for s in self._committed_speeds])
+            else:
+                spd.extend([self._v_max] * len(self._committed_pts))
         if prims:
-            p0, v0 = prims[0].state_at(0.0)
-            pts.append(p0)
-            spd.append(float(np.linalg.norm(v0)))
-        else:
+            # With a prefix the first primitive starts at the commit point (== last prefix
+            # point), so its t=0 sample is dropped below to avoid a duplicate.
+            if not has_prefix:
+                p0, v0 = prims[0].state_at(0.0)
+                pts.append(p0)
+                spd.append(float(np.linalg.norm(v0)))
+        elif not has_prefix:
             pts.append(np.zeros(3))
             spd.append(0.0)
         for prim in prims:
@@ -686,15 +716,21 @@ class PointMassPlanner:
         gate_rpys: np.ndarray | None = None,
         start_vel: np.ndarray | None = None,
         obstacle_manager: ObstacleManager | None = None,
+        committed_pts: np.ndarray | None = None,
+        committed_speeds: np.ndarray | None = None,
     ) -> PointMassPlanner:
         """Build a NEW planner with identical tuning but a fresh path (does not mutate self).
 
         Used by AsyncPMMReplanner: the background thread calls this with snapshots captured on
-        the control thread, so the worker never reads shared mutable state.
+        the control thread, so the worker never reads shared mutable state. ``committed_pts`` /
+        ``committed_speeds`` prepend a continuous near-field prefix (see plan()).
         """
         kwargs = dict(self._kwargs)
         kwargs["obstacle_manager"] = obstacle_manager
-        return PointMassPlanner(start_pos, gates_pos, gate_rpys, start_vel, **kwargs)
+        return PointMassPlanner(
+            start_pos, gates_pos, gate_rpys, start_vel,
+            committed_pts=committed_pts, committed_speeds=committed_speeds, **kwargs,
+        )
 
     def nearest_theta(self, pos: np.ndarray) -> float:
         """Arc-length parameter of the path point nearest to ``pos``."""
