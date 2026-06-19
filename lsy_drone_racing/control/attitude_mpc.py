@@ -385,10 +385,19 @@ class AttitudeMPC(Controller):
             dmat = np.linalg.norm(xy[:, None, :] - xy[None, :, :], axis=-1)
             np.fill_diagonal(dmat, np.inf)
             if float(dmat.min()) < 0.2:
+                import inspect
+
+                import lsy_drone_racing.envs.randomize as _rz
+
+                has_fix = "nominal_gates_pos=gates_pos" in inspect.getsource(_rz)
                 print(
                     "[WARN] AttitudeMPC: obs['gates_pos'] returned near-coincident gate centers "
                     f"at reset -> the observation is not exposing the real level-3 layout.\n"
-                    f"       loaded gate xy =\n{np.array2string(gate_positions, precision=3)}"
+                    f"       loaded gate xy =\n{np.array2string(gate_positions, precision=3)}\n"
+                    f"       env randomize.py actually loaded from: {_rz.__file__}\n"
+                    f"       that env file has the #91 nominal-layout fix: {has_fix}\n"
+                    "       -> if False, your interpreter is importing an outdated lsy_drone_racing; "
+                    "reinstall/point it at this repo so obs exposes all gate positions at reset."
                 )
 
         if self.USE_PMM_PLANNER:
