@@ -31,7 +31,9 @@ IMPORTANT — geometry-only handoff to the MPCC:
 from __future__ import annotations
 
 import heapq
+import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -40,6 +42,12 @@ from scipy.interpolate import CubicSpline
 
 if TYPE_CHECKING:
     from lsy_drone_racing.control.obstacle_manager import ObstacleManager
+
+# Shared logger for the whole PMM stack (planner + the controller's replan trigger).
+# Enable verbose planner output at runtime with:
+#     logging.getLogger("lsy_drone_racing.pmm").setLevel(logging.DEBUG)
+# INFO gives one line per plan (timing, cost, fallback); DEBUG adds graph/sampling/primitive detail.
+logger = logging.getLogger("lsy_drone_racing.pmm")
 
 
 # ----------------------------------------------------------------------------------------
@@ -271,16 +279,25 @@ class MotionPrimitive:
         self.T = max(ax.T for ax in full)
 
         self.axes: list[_Axis1D | _CubicAxis1D] = []
+        self.n_cubic = 0  # number of axes that fell back to cubic-Hermite synchronization
         for k in range(3):
             if full[k].T >= self.T - 1e-9:
                 self.axes.append(full[k])
             else:
-                self.axes.append(
-                    fixed_time_1d(
-                        p0[k], v0[k], pf[k], vf[k], -u_max[k], u_max[k], self.T,
-                        None if v_cap is None else v_cap[k],
-                    )
+                ax = fixed_time_1d(
+                    p0[k], v0[k], pf[k], vf[k], -u_max[k], u_max[k], self.T,
+                    None if v_cap is None else v_cap[k],
                 )
+                self.axes.append(ax)
+                if isinstance(ax, _CubicAxis1D):
+                    self.n_cubic += 1
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "cubic-Hermite fallback axis=%s: (p0=%.3f, v0=%.3f) -> "
+                            "(pf=%.3f, vf=%.3f), T_sync=%.3fs "
+                            "(alpha-scaled bang-bang could not reach T*)",
+                            "xyz"[k], p0[k], v0[k], pf[k], vf[k], self.T,
+                        )
 
     def state_at(self, t: float) -> tuple[np.ndarray, np.ndarray]:
         """Return (position, velocity) 3-vectors at time t."""
@@ -354,6 +371,15 @@ class _GraphPlanner:
                 states += [{"pos": c.copy(), "vel": d * s} for d, s in zip(dirs, speeds)]
             self.layers.append(states)
 
+        self.stats: dict = {}  # populated by solve(): node/edge/rejection counts, path cost
+        if logger.isEnabledFor(logging.DEBUG):
+            spd = [float(np.linalg.norm(s["vel"])) for layer in self.layers[1:] for s in layer]
+            logger.debug(
+                "sampling: %d gate(s) x %d samples/gate; |v| in [%.2f, %.2f] m/s, phi_max=%.0f deg",
+                len(gate_centers), n_samples,
+                min(spd) if spd else 0.0, max(spd) if spd else 0.0, np.rad2deg(phi_max),
+            )
+
     def _edge_ok(self, prim: MotionPrimitive) -> bool:
         if self.obs is None:
             return True
@@ -373,6 +399,7 @@ class _GraphPlanner:
 
         # Adjacency with the connecting primitive stored on each edge.
         adj: list[list[tuple[int, float, MotionPrimitive | None]]] = [[] for _ in range(sink + 1)]
+        n_edges = n_rej_collision = n_rej_infeasible = 0
         for li in range(len(self.layers) - 1):
             for ai, a in enumerate(self.layers[li]):
                 ua = node_ids[(li, ai)]
@@ -380,8 +407,13 @@ class _GraphPlanner:
                     prim = MotionPrimitive(
                         a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.v_axis_cap
                     )
-                    if not np.isfinite(prim.T) or not self._edge_ok(prim):
+                    if not np.isfinite(prim.T):
+                        n_rej_infeasible += 1
                         continue
+                    if not self._edge_ok(prim):
+                        n_rej_collision += 1
+                        continue
+                    n_edges += 1
                     adj[ua].append((node_ids[(li + 1, bi)], prim.T, prim))
         last = len(self.layers) - 1
         for ni in range(len(self.layers[last])):
@@ -404,6 +436,19 @@ class _GraphPlanner:
                     dist[v] = nd
                     prev[v] = (u, prim)
                     heapq.heappush(pq, (nd, v))
+
+        self.stats = {
+            "nodes": len(nodes),
+            "edges": n_edges,
+            "rejected_collision": n_rej_collision,
+            "rejected_infeasible": n_rej_infeasible,
+            "cost": float(dist[sink]),
+        }
+        logger.debug(
+            "graph: %d nodes, %d edges kept, %d rejected (collision=%d, infeasible=%d), best T=%.3fs",
+            len(nodes), n_edges, n_rej_collision + n_rej_infeasible,
+            n_rej_collision, n_rej_infeasible, dist[sink],
+        )
 
         if not np.isfinite(dist[sink]):
             return None
@@ -516,13 +561,37 @@ class PointMassPlanner:
             start_vel = d0 / (np.linalg.norm(d0) + 1e-9) * (self._speed_lo_frac * self._v_max)
         start_vel = np.asarray(start_vel, dtype=np.float64)
 
-        prims = self._run_graph(start_pos, start_vel, centers, normals, prune=True)
-        if prims is None:
+        t0 = time.perf_counter()
+        has_prefix = self._committed_pts is not None and len(self._committed_pts) > 0
+        logger.info(
+            "plan START: gates=%d, M=%d, committed_prefix=%s",
+            len(centers), self._n_vel_samples, has_prefix,
+        )
+
+        prims, stats = self._run_graph(start_pos, start_vel, centers, normals, prune=True)
+        used_fallback = prims is None
+        if used_fallback:
             # Robust fallback: a single nominal sample per gate, no collision pruning, so the
             # planner always returns a usable path (the MPCC's soft constraints handle clearance).
-            prims = self._run_graph(start_pos, start_vel, centers, normals, prune=False, single=True)
+            logger.warning(
+                "graph infeasible with pruning -> single-sample NO-COLLISION-CHECK fallback "
+                "(M=%d, phi=%.0f deg, gates=%d); path may clip obstacles",
+                self._n_vel_samples, np.rad2deg(self._phi_max), len(centers),
+            )
+            prims, stats = self._run_graph(
+                start_pos, start_vel, centers, normals, prune=False, single=True
+            )
 
         self._build_spline_from_primitives(prims, normals[-1] if normals else None)
+
+        n_cubic = sum(getattr(p, "n_cubic", 0) for p in (prims or []))
+        logger.info(
+            "plan DONE: %.1f ms, prims=%d, len=%.2f m, |v| in [%.2f, %.2f] m/s, "
+            "cost=%.3f s, cubic_axes=%d, fallback=%s",
+            1e3 * (time.perf_counter() - t0), len(prims or []), self._s_total,
+            float(self._speed_profile.min()), float(self._speed_profile.max()),
+            stats.get("cost", float("nan")), n_cubic, used_fallback,
+        )
 
     def rebuild(
         self, start_pos: np.ndarray, gates_pos: np.ndarray, gate_rpys: np.ndarray | None = None
@@ -574,7 +643,7 @@ class PointMassPlanner:
         normals: list[np.ndarray],
         prune: bool,
         single: bool = False,
-    ) -> list[MotionPrimitive] | None:
+    ) -> tuple[list[MotionPrimitive] | None, dict]:
         gp = _GraphPlanner(
             start_pos=start_pos,
             start_vel=start_vel,
@@ -589,7 +658,8 @@ class PointMassPlanner:
             n_collision_pts=self._n_collision_pts,
             seed=self._seed,
         )
-        return gp.solve()
+        prims = gp.solve()
+        return prims, gp.stats
 
     def _build_spline_from_primitives(
         self, prims: list[MotionPrimitive], final_normal: np.ndarray | None
@@ -718,15 +788,20 @@ class PointMassPlanner:
         obstacle_manager: ObstacleManager | None = None,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
+        n_vel_samples: int | None = None,
     ) -> PointMassPlanner:
         """Build a NEW planner with identical tuning but a fresh path (does not mutate self).
 
         Used by AsyncPMMReplanner: the background thread calls this with snapshots captured on
         the control thread, so the worker never reads shared mutable state. ``committed_pts`` /
-        ``committed_speeds`` prepend a continuous near-field prefix (see plan()).
+        ``committed_speeds`` prepend a continuous near-field prefix (see plan()). ``n_vel_samples``
+        overrides the per-gate sample count for this plan only (online replans use fewer samples
+        than the offline initial plan, trading a little path quality for low latency).
         """
         kwargs = dict(self._kwargs)
         kwargs["obstacle_manager"] = obstacle_manager
+        if n_vel_samples is not None:
+            kwargs["n_vel_samples"] = int(n_vel_samples)
         return PointMassPlanner(
             start_pos, gates_pos, gate_rpys, start_vel,
             committed_pts=committed_pts, committed_speeds=committed_speeds, **kwargs,

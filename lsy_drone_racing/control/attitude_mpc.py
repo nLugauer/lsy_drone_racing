@@ -10,6 +10,7 @@ Note that the trajectory uses pre-defined waypoints instead of dynamically gener
 from __future__ import annotations  # Python 3.10 type hints
 
 import json
+import logging
 import os
 import uuid
 from typing import TYPE_CHECKING
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from crazyflow import Sim
     from numpy.typing import NDArray
 
+# Shared with the PMM planner so one setLevel() controls all planner+replan logging:
+#     logging.getLogger("lsy_drone_racing.pmm").setLevel(logging.DEBUG)
+logger = logging.getLogger("lsy_drone_racing.pmm")
 
 
 def create_acados_model(
@@ -421,6 +425,13 @@ class AttitudeMPC(Controller):
             # then refits it as an arc-length cubic spline with the same API as TrajectoryPlanner.
             # v_max is kept consistent with the MPCC's v_theta cap; the planner emits geometry
             # only (no timing) and reads obstacles for graph-edge collision pruning.
+            # Tail past the last in-path gate must cover the MPCC look-ahead (~v_max * T_horizon),
+            # otherwise the reference piles up at the spline end and the drone brakes there. With a
+            # LOCAL replan horizon the last in-window gate is mid-track, so this matters on every
+            # replan, not only at the finish. tail_extension is captured in the planner's tuning
+            # snapshot, so async replans (_spawn) inherit the same value automatically.
+            v_max = 3.0
+            tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
@@ -428,7 +439,9 @@ class AttitudeMPC(Controller):
                 start_vel=np.array(obs["vel"], dtype=np.float64),
                 obstacle_manager=self._obstacle_manager,
                 u_max=10.0,
-                v_max=3.0,
+                v_max=v_max,
+                n_vel_samples=25,  # offline initial plan: more samples -> better global racing line
+                tail_extension=tail_extension,
             )
         else:
             self._trajectory = TrajectoryPlanner(
@@ -517,10 +530,19 @@ class AttitudeMPC(Controller):
         self._replanner = AsyncPMMReplanner() if self.USE_PMM_PLANNER else None
         self._planned_gates_pos = gate_positions.copy()  # gate positions used by the live plan
         self._planned_target = 0  # target-gate index at the last replan
-        # Receding horizon: plan through this many gates ahead of the current target. Defaults to
-        # all gates (cheap on this short track); lower it for long courses (paper Sec. VI-B).
-        self._planning_horizon = len(gate_positions)
-        self._replan_gate_move = 0.08  # [m] observed gate shift that triggers a replan
+        # Offline-global / online-local split:
+        #   * Initial plan (constructor above) uses ALL gates -> globally optimal racing line.
+        #   * Online REPLANS are local: they re-solve only the next few gates, where newly revealed
+        #     gate positions actually change the path. Far gates are still nominal (no new info) and
+        #     get re-timed by the MPCC anyway, so re-solving through them is wasted work.
+        # Paper (Sec. VI-B): N>=3 gives near-identical flight times to full-track planning. We use
+        # 2 here per the current experiment; raise toward 3 if boundary myopia shows up.
+        self._replan_horizon = 2  # gates ahead of the current target to replan through
+        # Online replans use fewer velocity samples than the offline initial plan (25): with the
+        # ~M^2 graph cost, 12 keeps a 2-gate replan at ~150-200 ms so it lands before going stale,
+        # while the initial plan can afford more samples for a better global line.
+        self._replan_vel_samples = 12
+        self._replan_gate_move = 0.03  # [m] observed gate shift that triggers a replan
         # Robustness: commit the near-field on replans. A replan only changes the path BEYOND this
         # look-ahead distance on the current trajectory; the segment in between is kept identical
         # so adoption never jumps the MPCC's immediate reference. Smaller = more reactive to a
@@ -654,7 +676,7 @@ class AttitudeMPC(Controller):
             # legacy spline keeps the constant target. Clip to the v_theta state bound (= 3 m/s).
             if self.USE_PMM_PLANNER:
                 yref_j = yref_target.copy()
-                yref_j[8] = float(np.clip(self._trajectory.evaluate_speed(theta_pred), 3, yref_target[8]))
+                yref_j[8] = float(np.clip(self._trajectory.evaluate_speed(theta_pred), 0.5, yref_target[8]))
                 self._acados_ocp_solver.set(j, "yref", yref_j)
 
         # Set parameters for the terminal node (N): extrapolate theta one more step
@@ -771,7 +793,21 @@ class AttitudeMPC(Controller):
                 self._trajectory = new_planner
                 self._reanchor_progress(obs)
                 self._needs_warm_start_reset = True  # previous warm start was for the old path
-            # else: discard the reversing plan and keep flying the current (forward) plan
+                logger.info(
+                    "REPLAN adopted: target_gate=%d, path_len=%.2f m",
+                    target, self._trajectory.total_length,
+                )
+            else:
+                # discard the reversing plan and keep flying the current (forward) plan
+                logger.warning("REPLAN discarded: reversing plan (target_gate=%d)", target)
+        elif new_planner is not None:
+            # A finished plan exists but its starting gate was passed during the planning latency
+            # -> stale. Discard; the trigger below immediately requests a fresh plan from the new
+            # target (target != self._planned_target).
+            logger.warning(
+                "REPLAN discarded: stale (built for gate %d, current target %d)",
+                self._planned_target, target,
+            )
 
         if target < 0:
             return  # final gate passed; nothing left to plan
@@ -779,7 +815,7 @@ class AttitudeMPC(Controller):
         # (2) Replan trigger: a gate within the planning window moved beyond the threshold (a
         # nominal->real reveal is a large jump), or we passed a gate (target advanced), which
         # recedes the horizon forward.
-        window = slice(target, min(target + self._planning_horizon, len(gates_pos)))
+        window = slice(target, min(target + self._replan_horizon, len(gates_pos)))
         moved = 0.0
         if window.stop > window.start:
             moved = float(
@@ -789,6 +825,12 @@ class AttitudeMPC(Controller):
             return
         if self._replanner.busy():
             return  # a replan is already running; this trigger is re-checked next tick
+
+        reason = "target_advance" if target != self._planned_target else f"gate_moved={moved:.3f}m"
+        logger.info(
+            "REPLAN trigger @tick=%d: reason=%s, target_gate=%d, window=[%d:%d] (%d gate[s])",
+            self._tick, reason, target, window.start, window.stop, window.stop - window.start,
+        )
 
         # Commit the near-field: the replan changes the path only BEYOND a short look-ahead on
         # the CURRENT trajectory. We start the new plan at the commit point (commit_distance ahead
@@ -836,6 +878,7 @@ class AttitudeMPC(Controller):
             lambda: planner._spawn(
                 start_pos, horizon_gates, horizon_rpys, start_vel, obs_snapshot,
                 committed_pts=committed_pts, committed_speeds=committed_speeds,
+                n_vel_samples=self._replan_vel_samples,
             )
         )
 

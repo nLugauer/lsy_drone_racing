@@ -286,31 +286,31 @@ class ObstacleManager:
         Returns:
             Boolean array of shape (N,), True if point intersects an obstacle.
         """
-        points_arr = np.asarray(points, dtype=np.float64)
+        points_arr = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         mask = np.zeros(points_arr.shape[0], dtype=bool)
         margin = self.safety_margin if margin is None else float(margin)
 
-        for idx, point in enumerate(points_arr):
-            for obs in self.obstacles:
-                r_total = float(obs["r"]) + margin
-                if obs["type"] == "sphere":
-                    if np.linalg.norm(point - obs["p1"]) <= r_total:
-                        mask[idx] = True
-                        break
+        # Vectorized over the (many) query points, looping only over the (few) obstacles. This is
+        # the hot path of PMM collision pruning — every graph edge calls it on ~20 points against
+        # ~18 capsules, so the previous per-point Python loop dominated planning time. Semantics are
+        # unchanged: a point is flagged if it lies within (radius + margin) of ANY obstacle.
+        for obs in self.obstacles:
+            if mask.all():
+                break  # every point already flagged; nothing left to test
+            r_total = float(obs["r"]) + margin
+            p1 = obs["p1"]
+            if obs["type"] == "sphere":
+                dist = np.linalg.norm(points_arr - p1, axis=1)
+            else:
+                v = obs["p2"] - p1
+                v_norm_sq = float(np.dot(v, v))
+                if v_norm_sq == 0.0:
+                    dist = np.linalg.norm(points_arr - p1, axis=1)
                 else:
-                    v = obs["p2"] - obs["p1"]
-                    w = point - obs["p1"]
-                    v_norm_sq = np.dot(v, v)
-                    if v_norm_sq == 0.0:
-                        closest = obs["p1"]
-                    else:
-                        t = np.dot(w, v) / v_norm_sq
-                        t = np.clip(t, 0.0, 1.0)
-                        closest = obs["p1"] + t * v
-
-                    if np.linalg.norm(point - closest) <= r_total:
-                        mask[idx] = True
-                        break
+                    t = np.clip((points_arr - p1) @ v / v_norm_sq, 0.0, 1.0)
+                    closest = p1 + t[:, None] * v  # (N, 3) nearest point on the segment
+                    dist = np.linalg.norm(points_arr - closest, axis=1)
+            mask |= dist <= r_total
 
         return mask
 
