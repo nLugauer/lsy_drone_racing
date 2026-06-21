@@ -204,48 +204,34 @@ def fixed_time_1d(
     u_hi: float,
     T_target: float,
     v_cap: float | None = None,
-) -> _Axis1D:
-    """Profile reaching (pf, vf) in exactly ``T_target`` by scaling the accel bounds by alpha.
+) -> _Axis1D | _CubicAxis1D:
+    """Profile reaching (pf, vf) in exactly ``T_target`` for axis synchronization.
 
-    Implements the per-axis synchronization of Sec. VI-A: the slower (critical) axis sets
-    T* = T_target, and faster axes are slowed by scaling their acceleration bounds by
-    alpha in (0, 1]. Since the minimum time decreases monotonically with alpha, alpha is
-    found by bisection (robust; runs offline, not in the 50 Hz loop).
+    In a 3-axis primitive the slowest (critical) axis sets T* = T_target; the faster axes have
+    slack and must be stretched to T* so all three finish together. The MPCC discards the PMM
+    timing and keeps only the geometric shape, so a stretched axis just needs a smooth curve that
+    hits (pf, vf) at exactly T_target — a cubic Hermite gives that in closed form.
+
+    (The paper slows the axis with an alpha-scaled bang-bang. That is near time-optimal, but its
+    time-optimality is thrown away here, and it cost an alpha sweep + bisection per axis per edge —
+    the dominant per-edge cost. The cubic is O(1), C2-smooth, and was already this function's
+    fallback, so it is now the primary path.)
+
+    ``v_cap`` is used only for the full-authority feasibility guard below; the cubic stretch itself
+    ignores it, which is safe: a stretched axis has slack, so the gentle cubic stays well within
+    the speed bound, and the exported v_theta reference is clipped to v_max downstream anyway.
     """
     # Trivial axis already at the target and at rest: just hold for the full duration.
     if abs(pf - p0) < 1e-9 and abs(v0) < 1e-9 and abs(vf) < 1e-9:
         return _Axis1D(p0, 0.0, [(0.0, T_target)])
 
+    # If even at full authority the axis cannot reach T_target (T_target <= its own min time), it
+    # is effectively the critical axis: return the true bang-bang, no stretching required.
     full = min_time_1d(p0, v0, pf, vf, u_lo, u_hi, v_cap)
     if full.T >= T_target - 1e-6:
-        return full  # already at or above the target time at full authority
+        return full
 
-    # Faithful attempt: alpha-scaled bang-bang (paper Sec. VI-A). Sweep alpha downward only
-    # within the monotonic region (min-time increases as authority drops). Reducing alpha too
-    # far yields spurious large-overshoot solutions, so stop as soon as monotonicity breaks.
-    def T_of(a: float) -> float:
-        return min_time_1d(p0, v0, pf, vf, a * u_lo, a * u_hi, v_cap).T
-
-    prev_a, prev_T = 1.0, full.T
-    for a in np.linspace(1.0, 0.05, 40)[1:]:
-        T_a = T_of(a)
-        if not np.isfinite(T_a) or T_a < prev_T - 1e-9:
-            break  # left the well-behaved region
-        if T_a >= T_target:  # bracket [a, prev_a]; T decreasing in alpha
-            lo, hi = a, prev_a
-            for _ in range(50):
-                mid = 0.5 * (lo + hi)
-                if T_of(mid) > T_target:
-                    lo = mid
-                else:
-                    hi = mid
-            cand = min_time_1d(p0, v0, pf, vf, hi * u_lo, hi * u_hi, v_cap)
-            if abs(cand.T - T_target) < 1e-2:
-                return cand
-            break
-        prev_a, prev_T = a, T_a
-
-    # Robust fallback: cubic Hermite reaching (pf, vf) at exactly T_target.
+    # Stretch to exactly T_target with a smooth cubic Hermite.
     return _CubicAxis1D(p0, v0, pf, vf, T_target)
 
 
@@ -279,7 +265,8 @@ class MotionPrimitive:
         self.T = max(ax.T for ax in full)
 
         self.axes: list[_Axis1D | _CubicAxis1D] = []
-        self.n_cubic = 0  # number of axes that fell back to cubic-Hermite synchronization
+        self.n_cubic = 0  # non-critical axes stretched to T* with a cubic Hermite (vs the bang-bang
+        # critical axis); surfaced as "cubic_axes" in the per-plan log to show how much stretching.
         for k in range(3):
             if full[k].T >= self.T - 1e-9:
                 self.axes.append(full[k])
@@ -291,13 +278,6 @@ class MotionPrimitive:
                 self.axes.append(ax)
                 if isinstance(ax, _CubicAxis1D):
                     self.n_cubic += 1
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            "cubic-Hermite fallback axis=%s: (p0=%.3f, v0=%.3f) -> "
-                            "(pf=%.3f, vf=%.3f), T_sync=%.3fs "
-                            "(alpha-scaled bang-bang could not reach T*)",
-                            "xyz"[k], p0[k], v0[k], pf[k], vf[k], self.T,
-                        )
 
     def state_at(self, t: float) -> tuple[np.ndarray, np.ndarray]:
         """Return (position, velocity) 3-vectors at time t."""
