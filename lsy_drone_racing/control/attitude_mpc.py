@@ -305,6 +305,14 @@ class AttitudeMPC(Controller):
     # toggle for A/B lap-time comparison.
     USE_PMM_PLANNER = True
 
+    # PMM obstacle awareness. True -> the PMM prunes graph edges against poles + non-window gates
+    # (collision-aware racing line). False -> the PMM ignores obstacles entirely; the MPCC's hard
+    # constraints own all avoidance using LIVE positions. The PMM only ever sees pole positions as
+    # of the last GATE-triggered replan (pole reveals don't trigger replans), so the MPCC is the
+    # better-informed avoider; this also removes the no-pruning fallback. Set False to A/B the
+    # obstacle-unaware design (this experimental branch).
+    PMM_OBSTACLE_AWARE = False
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
 
@@ -432,16 +440,19 @@ class AttitudeMPC(Controller):
             # snapshot, so async replans (_spawn) inherit the same value automatically.
             v_max = 3.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
-            # The initial plan routes through ALL gates, so exclude every gate's own frame from the
-            # PMM's collision pruning (we MUST fly through those openings); poles still block. The
-            # MPCC keeps the full obstacle set for its hard constraints, so clearance is unchanged.
+            # Obstacle handling depends on PMM_OBSTACLE_AWARE. When aware, the initial plan routes
+            # through ALL gates, so exclude every gate's own frame from the PMM's collision pruning
+            # (we MUST fly through those openings); poles still block. When unaware, pass no
+            # obstacles -> the PMM ignores them and the MPCC owns avoidance. Either way the MPCC
+            # keeps the full obstacle set for its hard constraints, so clearance is unchanged.
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
                 gate_rpys=gate_rpys,
                 start_vel=np.array(obs["vel"], dtype=np.float64),
-                obstacle_manager=self._obstacle_manager.snapshot(
-                    exclude_gate_centers=gate_positions
+                obstacle_manager=(
+                    self._obstacle_manager.snapshot(exclude_gate_centers=gate_positions)
+                    if self.PMM_OBSTACLE_AWARE else None
                 ),
                 u_max=10.0,
                 v_max=v_max,
@@ -900,9 +911,14 @@ class AttitudeMPC(Controller):
         horizon_rpys = (
             np.array(gates_rpys[window], dtype=np.float64) if gates_rpys is not None else None
         )
-        # Exclude only the gates THIS replan routes through (the window); other gates + poles still
-        # block, so the local plan can't clip a gate it isn't crossing.
-        obs_snapshot = self._obstacle_manager.snapshot(exclude_gate_centers=horizon_gates)
+        # Obstacle handling depends on PMM_OBSTACLE_AWARE. When aware, exclude only the gates THIS
+        # replan routes through (the window); other gates + poles still block, so the local plan
+        # can't clip a gate it isn't crossing. When unaware, pass no obstacles -> the PMM does not
+        # prune (no fallback) and the MPCC owns avoidance with live positions.
+        obs_snapshot = (
+            self._obstacle_manager.snapshot(exclude_gate_centers=horizon_gates)
+            if self.PMM_OBSTACLE_AWARE else None
+        )
         planner = self._trajectory  # captured by the closure; _spawn reuses its tuning
         self._replanner.request(
             lambda: planner._spawn(
