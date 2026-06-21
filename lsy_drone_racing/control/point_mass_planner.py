@@ -350,11 +350,13 @@ class _GraphPlanner:
         obstacle_manager: ObstacleManager | None,
         n_collision_pts: int,
         seed: int,
+        collision_margin: float = 0.05,
     ) -> None:
         self.u_max = u_max
         self.v_axis_cap = np.full(3, float(v_max))  # per-axis velocity cap for the primitives
         self.obs = obstacle_manager
         self.n_collision_pts = n_collision_pts
+        self.collision_margin = float(collision_margin)
         rng = np.random.default_rng(seed)
 
         v_mag = float(v_max)  # largest sampled gate speed (as a norm)
@@ -384,7 +386,7 @@ class _GraphPlanner:
         if self.obs is None:
             return True
         pts = prim.sample_positions(self.n_collision_pts)
-        return not bool(self.obs.points_in_obstacles(pts).any())
+        return not bool(self.obs.points_in_obstacles(pts, margin=self.collision_margin).any())
 
     def solve(self) -> list[MotionPrimitive] | None:
         """Return the minimum-time list of primitives through all gates, or None."""
@@ -485,11 +487,12 @@ class PointMassPlanner:
         u_max: float | np.ndarray = 10.0,
         v_max: float | np.ndarray = 3.0,
         n_vel_samples: int = 5,
-        phi_max: float = np.deg2rad(40.0),
+        phi_max: float = np.deg2rad(30.0),
         speed_lo_frac: float = 0.5,
         n_eval_points: int = 500,
         n_path_samples_per_seg: int = 60,
         n_collision_pts: int = 20,
+        collision_margin: float = 0.05,
         min_z: float = 0.15,
         tail_extension: float = 0.5,
         seed: int = 0,
@@ -509,6 +512,12 @@ class PointMassPlanner:
         self._n_eval_points = int(n_eval_points)
         self._n_path_samples = int(n_path_samples_per_seg)
         self._n_collision_pts = int(n_collision_pts)
+        # Collision-pruning margin for the PMM graph only. Deliberately smaller than the MPCC's
+        # hard-constraint safety margin (~0.14 m): the PMM just needs to avoid gross collisions
+        # while sampling candidate lines; the MPCC owns the final, conservative clearance. A large
+        # PMM margin over-prunes (it leaves only a few cm of clear gate opening) and forces the
+        # single-sample no-collision-check fallback.
+        self._collision_margin = float(collision_margin)
         self._min_z = float(min_z)
         self._tail = float(tail_extension)
         self._seed = int(seed)
@@ -518,8 +527,8 @@ class PointMassPlanner:
             u_max=self._u_max, v_max=self._v_max, n_vel_samples=self._n_vel_samples,
             phi_max=self._phi_max, speed_lo_frac=self._speed_lo_frac,
             n_eval_points=self._n_eval_points, n_path_samples_per_seg=self._n_path_samples,
-            n_collision_pts=self._n_collision_pts, min_z=self._min_z,
-            tail_extension=self._tail, seed=self._seed,
+            n_collision_pts=self._n_collision_pts, collision_margin=self._collision_margin,
+            min_z=self._min_z, tail_extension=self._tail, seed=self._seed,
         )
 
         self.plan(start_pos, gates_pos, gate_rpys, start_vel, committed_pts, committed_speeds)
@@ -657,6 +666,7 @@ class PointMassPlanner:
             obstacle_manager=None if not prune else self._obs,
             n_collision_pts=self._n_collision_pts,
             seed=self._seed,
+            collision_margin=self._collision_margin,
         )
         prims = gp.solve()
         return prims, gp.stats

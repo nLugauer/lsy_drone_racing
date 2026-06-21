@@ -432,12 +432,17 @@ class AttitudeMPC(Controller):
             # snapshot, so async replans (_spawn) inherit the same value automatically.
             v_max = 3.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
+            # The initial plan routes through ALL gates, so exclude every gate's own frame from the
+            # PMM's collision pruning (we MUST fly through those openings); poles still block. The
+            # MPCC keeps the full obstacle set for its hard constraints, so clearance is unchanged.
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
                 gate_rpys=gate_rpys,
                 start_vel=np.array(obs["vel"], dtype=np.float64),
-                obstacle_manager=self._obstacle_manager,
+                obstacle_manager=self._obstacle_manager.snapshot(
+                    exclude_gate_centers=gate_positions
+                ),
                 u_max=10.0,
                 v_max=v_max,
                 n_vel_samples=25,  # offline initial plan: more samples -> better global racing line
@@ -872,7 +877,9 @@ class AttitudeMPC(Controller):
         horizon_rpys = (
             np.array(gates_rpys[window], dtype=np.float64) if gates_rpys is not None else None
         )
-        obs_snapshot = self._obstacle_manager.snapshot()
+        # Exclude only the gates THIS replan routes through (the window); other gates + poles still
+        # block, so the local plan can't clip a gate it isn't crossing.
+        obs_snapshot = self._obstacle_manager.snapshot(exclude_gate_centers=horizon_gates)
         planner = self._trajectory  # captured by the closure; _spawn reuses its tuning
         self._replanner.request(
             lambda: planner._spawn(

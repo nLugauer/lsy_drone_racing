@@ -260,7 +260,9 @@ class ObstacleManager:
             self.obstacles[pole_idx]["p1"] = start_point
             self.obstacles[pole_idx]["p2"] = end_point
 
-    def snapshot(self) -> ObstacleManager:
+    def snapshot(
+        self, exclude_gate_centers: np.ndarray | None = None, exclude_tol: float = 0.3
+    ) -> ObstacleManager:
         """Return a frozen, independent copy for thread-safe collision queries.
 
         The control thread updates obstacle positions every tick (update_gate_positions /
@@ -268,11 +270,28 @@ class ObstacleManager:
         points_in_obstacles. Handing the planner this copy lets it see a consistent set of
         positions while it runs off the control thread. Only the geometry needed by
         points_in_obstacles is copied (type, endpoints, radius, margin).
+
+        ``exclude_gate_centers``: drop the 4 frame capsules of every gate whose center is within
+        ``exclude_tol`` (m) of any listed center. The PMM passes the gates it is routing THROUGH,
+        so its collision pruning no longer rejects the (required) act of flying through those
+        gates' openings — yet poles and the OTHER gates still block edges. This removes the main
+        cause of the "no pruning" fallback (the gate frame leaves only a few cm of clear opening
+        at the exact center, which angled sampled crossings overshoot). The MPCC's own hard
+        constraints still use the full obstacle set, so final clearance is unaffected.
         """
+        exclude_idx: set[int] = set()
+        if exclude_gate_centers is not None:
+            ec = np.asarray(exclude_gate_centers, dtype=np.float64).reshape(-1, 3)
+            if len(ec) > 0:
+                for gi, gate in enumerate(self.gates):
+                    if float(np.min(np.linalg.norm(ec - gate["pos"], axis=1))) <= exclude_tol:
+                        exclude_idx.update(self._gate_obstacle_indices[gi])
+
         snap = ObstacleManager(safety_margin=self.safety_margin)
         snap.obstacles = [
             {"type": o["type"], "p1": o["p1"].copy(), "p2": o["p2"].copy(), "r": float(o["r"])}
-            for o in self.obstacles
+            for i, o in enumerate(self.obstacles)
+            if i not in exclude_idx
         ]
         return snap
 
