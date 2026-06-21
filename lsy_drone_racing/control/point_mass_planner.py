@@ -478,6 +478,8 @@ class PointMassPlanner:
         seed: int = 0,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
+        committed_suffix_pts: np.ndarray | None = None,
+        committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
         self._u_max = np.full(3, float(u_max)) if np.isscalar(u_max) else np.asarray(u_max, float)
         # v_max is the maximum SPEED (velocity norm). It is used both as the per-axis velocity
@@ -511,7 +513,10 @@ class PointMassPlanner:
             min_z=self._min_z, tail_extension=self._tail, seed=self._seed,
         )
 
-        self.plan(start_pos, gates_pos, gate_rpys, start_vel, committed_pts, committed_speeds)
+        self.plan(
+            start_pos, gates_pos, gate_rpys, start_vel, committed_pts, committed_speeds,
+            committed_suffix_pts, committed_suffix_speeds,
+        )
 
     # -- planning -------------------------------------------------------------------------
     def plan(
@@ -522,13 +527,21 @@ class PointMassPlanner:
         start_vel: np.ndarray | None = None,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
+        committed_suffix_pts: np.ndarray | None = None,
+        committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
         """Run the PMM graph search and build the arc-length spline.
 
-        ``committed_pts`` / ``committed_speeds`` (optional) are a near-field prefix taken from the
+        ``committed_pts`` / ``committed_speeds`` (optional) are a near-field PREFIX taken from the
         previously-active trajectory. When supplied, ``start_pos`` is the END of that prefix and
         the prefix is prepended to the new path, so the segment the MPCC is already tracking stays
         continuous across the replan (no reference jump). See AttitudeMPC._maybe_replan_pmm.
+
+        ``committed_suffix_pts`` / ``committed_suffix_speeds`` (optional) are a far-field SUFFIX,
+        taken from the offline backbone beyond the replanned gates. Appended after the freshly
+        planned primitives, it preserves the high-quality global racing line for the part of the
+        track this local replan does not touch (instead of discarding it). Layout of one plan:
+        [prefix from current path] + [primitives through the window gates] + [backbone suffix].
         """
         self._committed_pts = (
             None if committed_pts is None
@@ -537,6 +550,14 @@ class PointMassPlanner:
         self._committed_speeds = (
             None if committed_speeds is None
             else np.asarray(committed_speeds, dtype=np.float64).reshape(-1)
+        )
+        self._committed_suffix_pts = (
+            None if committed_suffix_pts is None
+            else np.asarray(committed_suffix_pts, dtype=np.float64).reshape(-1, 3)
+        )
+        self._committed_suffix_speeds = (
+            None if committed_suffix_speeds is None
+            else np.asarray(committed_suffix_speeds, dtype=np.float64).reshape(-1)
         )
         start_pos = np.asarray(start_pos, dtype=np.float64)
         gates_pos = np.asarray(gates_pos, dtype=np.float64).reshape(-1, 3)
@@ -688,11 +709,29 @@ class PointMassPlanner:
                 p, v = prim.state_at(t)
                 pts.append(p)
                 spd.append(float(np.linalg.norm(v)))
+
+        # Far-field SUFFIX: append the offline backbone beyond the replanned window so the global
+        # racing line is preserved (Part 2). The first suffix point may sit close to the last
+        # primitive point; the zero-length-segment drop during arc-length resampling handles any
+        # near-duplicate, and the cubic fit smooths the (small) join.
+        has_suffix = self._committed_suffix_pts is not None and len(self._committed_suffix_pts) > 0
+        if has_suffix:
+            pts.extend(list(self._committed_suffix_pts))
+            if (
+                self._committed_suffix_speeds is not None
+                and len(self._committed_suffix_speeds) == len(self._committed_suffix_pts)
+            ):
+                spd.extend([float(s) for s in self._committed_suffix_speeds])
+            else:
+                spd.extend([self._v_max] * len(self._committed_suffix_pts))
+
         dense = np.array(pts, dtype=np.float64)
         speed_dense = np.array(spd, dtype=np.float64)
 
-        # Tail extension past the final gate so the MPCC horizon never stalls at the endpoint.
-        if self._tail > 0.0 and len(dense) >= 2:
+        # Tail extension past the final point so the MPCC horizon never stalls at the endpoint.
+        # Skipped when a backbone suffix is present: that suffix already runs to the backbone's end,
+        # which carries the backbone's own tail past the final gate.
+        if self._tail > 0.0 and not has_suffix and len(dense) >= 2:
             tang = dense[-1] - dense[-2]
             tang = tang / (np.linalg.norm(tang) + 1e-9)
             if final_normal is not None and np.dot(tang, final_normal) < 0:
@@ -778,15 +817,18 @@ class PointMassPlanner:
         obstacle_manager: ObstacleManager | None = None,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
+        committed_suffix_pts: np.ndarray | None = None,
+        committed_suffix_speeds: np.ndarray | None = None,
         n_vel_samples: int | None = None,
     ) -> PointMassPlanner:
         """Build a NEW planner with identical tuning but a fresh path (does not mutate self).
 
         Used by AsyncPMMReplanner: the background thread calls this with snapshots captured on
         the control thread, so the worker never reads shared mutable state. ``committed_pts`` /
-        ``committed_speeds`` prepend a continuous near-field prefix (see plan()). ``n_vel_samples``
-        overrides the per-gate sample count for this plan only (online replans use fewer samples
-        than the offline initial plan, trading a little path quality for low latency).
+        ``committed_speeds`` prepend a continuous near-field prefix; ``committed_suffix_pts`` /
+        ``committed_suffix_speeds`` append the offline-backbone far-field (see plan()).
+        ``n_vel_samples`` overrides the per-gate sample count for this plan only (online replans
+        use fewer samples than the offline initial plan, trading path quality for low latency).
         """
         kwargs = dict(self._kwargs)
         kwargs["obstacle_manager"] = obstacle_manager
@@ -794,7 +836,9 @@ class PointMassPlanner:
             kwargs["n_vel_samples"] = int(n_vel_samples)
         return PointMassPlanner(
             start_pos, gates_pos, gate_rpys, start_vel,
-            committed_pts=committed_pts, committed_speeds=committed_speeds, **kwargs,
+            committed_pts=committed_pts, committed_speeds=committed_speeds,
+            committed_suffix_pts=committed_suffix_pts,
+            committed_suffix_speeds=committed_suffix_speeds, **kwargs,
         )
 
     def nearest_theta(self, pos: np.ndarray) -> float:

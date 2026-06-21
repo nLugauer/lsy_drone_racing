@@ -533,6 +533,12 @@ class AttitudeMPC(Controller):
         # stalls on the ~150 ms plan. We remember the gate positions baked into the current plan
         # to detect such changes.
         self._replanner = AsyncPMMReplanner() if self.USE_PMM_PLANNER else None
+        # Offline backbone: the pristine high-M global plan built above. Online replans patch only
+        # the local window and splice THIS backbone's far-field back in as a committed suffix, so
+        # the global racing line is never discarded. It is never replaced (downstream gates stay
+        # nominal until their own reveal patches them). None for the legacy spline planner.
+        self._backbone = self._trajectory if self.USE_PMM_PLANNER else None
+        self._suffix_gap = 0.5  # [m] start the backbone suffix this far past the last window gate
         self._planned_gates_pos = gate_positions.copy()  # gate positions used by the live plan
         self._planned_target = 0  # target-gate index at the last replan
         # Offline-global / online-local split:
@@ -872,6 +878,23 @@ class AttitudeMPC(Controller):
             start_pos = np.array(obs["pos"], dtype=np.float64)
             start_vel = np.array(obs["vel"], dtype=np.float64)
 
+        # Far-field suffix (Part 2): reuse the offline backbone beyond the replan window so the
+        # high-M global racing line is preserved instead of being re-solved at low M every replan.
+        # Anchored just past the last window gate; covers all downstream gates (still nominal until
+        # their own reveal) out to the backbone's end. Read here on the control thread (the backbone
+        # is never mutated) so the worker only sees frozen arrays.
+        committed_suffix_pts = None
+        committed_suffix_speeds = None
+        if self._backbone is not None and window.stop < len(gates_pos):
+            bb = self._backbone
+            theta_we = float(bb.nearest_theta(gates_pos[window.stop - 1]))
+            theta_suffix = min(theta_we + self._suffix_gap, bb.total_length)
+            if bb.total_length - theta_suffix > 0.05:
+                n_suf = int(np.clip((bb.total_length - theta_suffix) / 0.05, 10, 300))
+                s_suf = np.linspace(theta_suffix, bb.total_length, n_suf)
+                committed_suffix_pts = np.asarray(bb.evaluate(s_suf), dtype=np.float64)
+                committed_suffix_speeds = np.asarray(bb.evaluate_speed(s_suf), dtype=np.float64)
+
         # Capture snapshots on this (control) thread so the worker reads no shared mutable state.
         horizon_gates = np.array(gates_pos[window], dtype=np.float64)
         horizon_rpys = (
@@ -885,6 +908,8 @@ class AttitudeMPC(Controller):
             lambda: planner._spawn(
                 start_pos, horizon_gates, horizon_rpys, start_vel, obs_snapshot,
                 committed_pts=committed_pts, committed_speeds=committed_speeds,
+                committed_suffix_pts=committed_suffix_pts,
+                committed_suffix_speeds=committed_suffix_speeds,
                 n_vel_samples=self._replan_vel_samples,
             )
         )
