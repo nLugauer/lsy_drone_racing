@@ -32,6 +32,11 @@ Problem with trajectory planner:
         )
    ```
 
-* does often get stuck at obstacles: gradient better
+* ~~does often get stuck at obstacles: gradient better~~
+  * already does this inside of the obstacle
+  * if any changes here switch to MPCC++ or gradiant flieds
 * 
 
+* if gates are close to each other the replanning is happening to fast, leaving the drone all by its own
+
+* jump in cost funtion -> instability, look picture

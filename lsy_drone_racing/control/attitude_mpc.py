@@ -224,12 +224,12 @@ def create_ocp_solver(
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
     ocp.constraints.lbx = np.array([-2.0, -2.0, -2.0, 0.0])
-    ocp.constraints.ubx = np.array([2.0, 2.0, 2.0, 5.0])  # v_θ capped at 5 m/s
+    ocp.constraints.ubx = np.array([2.0, 2.0, 2.0, 4.0])  # v_θ capped at 4 m/s
     ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
     ocp.constraints.lbu = np.array([-2.0, -2.0, -2.0, parameters["thrust_min"] * 4, 0.01])
-    ocp.constraints.ubu = np.array([2.0, 2.0, 2.0, parameters["thrust_max"] * 4, 5.0])
+    ocp.constraints.ubu = np.array([2.0, 2.0, 2.0, parameters["thrust_max"] * 4, 15.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -328,10 +328,11 @@ class AttitudeMPC(Controller):
         self._log_contour = []
         self._log_lag = []
         self._log_v_theta = []
+        self._log_a_theta = []
         self._log_q_c = []
         self.last_solver_status = 0
 
-        self._obstacle_manager = ObstacleManager(safety_margin=0.08)
+        self._obstacle_manager = ObstacleManager(safety_margin=0.11)
 
         # Resolve the initial track layout. Two separate cases, because level 3 hides the real
         # layout from the config file:
@@ -436,7 +437,7 @@ class AttitudeMPC(Controller):
             # LOCAL replan horizon the last in-window gate is mid-track, so this matters on every
             # replan, not only at the finish. tail_extension is captured in the planner's tuning
             # snapshot, so async replans (_spawn) inherit the same value automatically.
-            v_max = 5.0
+            v_max = 4.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
             # The initial plan routes through ALL gates, so exclude every gate's own frame from the
             # PMM's collision pruning (we MUST fly through those openings); poles still block. The
@@ -449,7 +450,7 @@ class AttitudeMPC(Controller):
                 obstacle_manager=self._obstacle_manager.snapshot(
                     exclude_gate_centers=gate_positions
                 ),
-                u_max=5.0,
+                u_max=21.0,
                 v_max=v_max,
                 n_vel_samples=100,  # offline initial plan: more samples -> better global line
                 tail_extension=tail_extension,
@@ -556,24 +557,24 @@ class AttitudeMPC(Controller):
         #     get re-timed by the MPCC anyway, so re-solving through them is wasted work.
         # Paper (Sec. VI-B): N>=3 gives near-identical flight times to full-track planning. We use
         # 2 here per the current experiment; raise toward 3 if boundary myopia shows up.
-        self._replan_horizon = 2  # gates ahead of the current target to replan through
+        self._replan_horizon = 3  # gates ahead of the current target to replan through
         # Online replans use fewer velocity samples than the offline initial plan (25): with the
         # ~M^2 graph cost, 12 keeps a 2-gate replan at ~150-200 ms so it lands before going stale,
         # while the initial plan can afford more samples for a better global line.
-        self._replan_vel_samples = 30
-        self._replan_gate_move = 0.03  # [m] observed gate shift that triggers a replan
+        self._replan_vel_samples = 150
+        self._replan_gate_move = 0.06  # [m] observed gate shift that triggers a replan
         # Robustness: commit the near-field on replans. A replan only changes the path BEYOND this
         # look-ahead distance on the current trajectory; the segment in between is kept identical
         # so adoption never jumps the MPCC's immediate reference. Smaller = more reactive to a
         # newly revealed gate; larger = smoother. Keep it below the sensor range (0.7 m).
-        self._commit_distance = 0.3
+        self._commit_distance = 0.4
         # Minimum approach room [m] left in front of the target gate when committing the near-field
         # on a replan. Must be large enough for the PMM to swing its velocity onto the gate's +x
         # crossing direction after a position reveal. Too small (e.g. 0.1) forces the planner to
         # re-thread a freshly revealed, laterally shifted gate within a fraction of a metre while
         # still carrying near-full speed -> with bounded acceleration it overshoots and curls back,
         # producing the visible loop right before the gate.
-        self._gate_approach_margin = 0.9
+        self._gate_approach_margin = 0.4
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -623,7 +624,9 @@ class AttitudeMPC(Controller):
 
         # Define the terminal condition:
         # The environment sets target_gate to -1 exactly when the final gate plane is crossed.
-        if "target_gate" in obs and int(obs["target_gate"]) == -1:
+        # Define the terminal condition and get the current target gate:
+        target_gate_idx = int(obs.get("target_gate", 0))
+        if target_gate_idx == -1:
             self._finished = True
 
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
@@ -679,7 +682,7 @@ class AttitudeMPC(Controller):
 
             px_j, py_j, pz_j, theta_offset_j = self._trajectory.get_polynomial_coeffs_at(theta_pred)
             pos_pred = self._trajectory.evaluate(theta_pred)
-            q_c_j = self._obstacle_manager.dynamic_contour_weight(pos_pred)
+            q_c_j = self._obstacle_manager.dynamic_contour_weight(pos_pred, target_gate_idx)
 
             params_j = np.zeros((total_params,))
             params_j[0:4] = px_j.flatten()
@@ -709,7 +712,7 @@ class AttitudeMPC(Controller):
         )
         px_N, py_N, pz_N, theta_offset_N = self._trajectory.get_polynomial_coeffs_at(theta_N)
         pos_N = self._trajectory.evaluate(theta_N)
-        q_c_N = self._obstacle_manager.dynamic_contour_weight(pos_N)
+        q_c_N = self._obstacle_manager.dynamic_contour_weight(pos_N, target_gate_idx)
         params_N = np.zeros((total_params,))
         params_N[0:4] = px_N.flatten()
         params_N[4:8] = py_N.flatten()
@@ -738,6 +741,8 @@ class AttitudeMPC(Controller):
         self._current_theta = float(x1_opt[13])
         self._current_v_theta = float(x1_opt[14])
 
+        current_a_theta = float(u0_aug[4])
+
         u0 = u0_aug[0:4]
         self._last_thrust = float(u0[3])  # Save thrust command for next tick
         self._last_u0 = u0.copy()
@@ -752,7 +757,7 @@ class AttitudeMPC(Controller):
         e_cont_vec = e_pos - e_lag_val * t_norm
         e_cont_val = np.linalg.norm(e_cont_vec)
 
-        q_c_current = self._obstacle_manager.dynamic_contour_weight(p_ref)
+        q_c_current = self._obstacle_manager.dynamic_contour_weight(p_ref, target_gate_idx)
 
         self._log_thrust.append(float(u0[3]))
         self._log_roll.append(float(u0[0]))
@@ -760,6 +765,7 @@ class AttitudeMPC(Controller):
         self._log_contour.append(float(e_cont_val))
         self._log_lag.append(float(e_lag_val))
         self._log_v_theta.append(self._current_v_theta)
+        self._log_a_theta.append(float(current_a_theta))
         self._log_q_c.append(float(q_c_current))
 
         return u0
@@ -1023,7 +1029,7 @@ class AttitudeMPC(Controller):
             max_thrust = self.drone_params["thrust_max"] * 4
             min_thrust = self.drone_params["thrust_min"] * 4
 
-            fig, axs = plt.subplots(5, 1, figsize=(10, 15), sharex=True)
+            fig, axs = plt.subplots(6, 1, figsize=(10, 18), sharex=True)
 
             axs[0].plot(self._log_contour, label="Contour Error (e_c)")
             axs[0].plot(self._log_lag, label="Lag Error (e_l)")
@@ -1048,7 +1054,7 @@ class AttitudeMPC(Controller):
             axs[2].grid(True)
 
             axs[3].plot(self._log_v_theta, label="Virtual Speed (v_theta)")
-            axs[3].axhline(15.0, color="g", linestyle="--", label="Target Speed")
+            axs[3].axhline(7.5, color="g", linestyle="--", label="Target Speed")
             axs[3].set_ylabel("Speed [m/s]")
             axs[3].legend()
             axs[3].grid(True)
@@ -1058,6 +1064,14 @@ class AttitudeMPC(Controller):
             axs[4].set_xlabel("Timestep")
             axs[4].legend()
             axs[4].grid(True)
+
+            axs[5].plot(self._log_a_theta, label="Virtual Accel (a_theta)", color="orange")
+            axs[5].axhline(5.0, color="r", linestyle="--", label="Upper Limit")
+            axs[5].axhline(0.01, color="r", linestyle="--", label="Lower Limit")
+            axs[5].set_ylabel("Accel [m/s^2]")
+            axs[5].set_xlabel("Timestep")
+            axs[5].legend()
+            axs[5].grid(True)
 
             fig.tight_layout()
             fig.savefig("mpcc_standard_metrics.png")
@@ -1070,5 +1084,6 @@ class AttitudeMPC(Controller):
             self._log_contour.clear()
             self._log_lag.clear()
             self._log_v_theta.clear()
+            self._log_a_theta.clear()
             self._log_q_c.clear()
             self._tick = 0

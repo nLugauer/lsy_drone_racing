@@ -1,9 +1,9 @@
 # mpcc_config.yaml
 # Optimized parameters from TuRBO optimization run
-Q_c: 20
-Q_l: 5
-R_u: 100.00
-mu: 1.0
-R_T: 5.00
+Q_c: 10
+Q_l: 20
+R_u: 10.00 # turn too high is -> starts really slow
+mu: 0.1
+R_T: 280.00
 Z_l: 4e+03
 z_l: 4e+03

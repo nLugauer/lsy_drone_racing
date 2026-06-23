@@ -31,8 +31,8 @@ class ObstacleManager:
         self._gate_obstacle_indices = []
         self._pole_obstacle_indices = []
         self._q_nom = 1.0
-        self._q_wp = 1000.0
-        self._sigma_sq = 0.25**2
+        self._q_wp = 300.0
+        self._sigma_sq = 0.35**2
 
     def add_sphere(self, center: np.ndarray, radius: float) -> None:
         """Add a spherical obstacle.
@@ -364,7 +364,9 @@ class ObstacleManager:
 
         return float(min_dist if min_dist != float("inf") else 0.0)
 
-    def dynamic_contour_weight(self, position: np.ndarray) -> float:
+    def dynamic_contour_weight(
+        self, position: np.ndarray, target_gate_idx: int | None = None
+    ) -> float:
         """Compute dynamic contour weight based on gate proximity.
 
         Near gates, increases the weighting of contour error in the MPCC cost.
@@ -372,14 +374,24 @@ class ObstacleManager:
 
         Args:
             position: Current drone position [x, y, z].
+            target_gate_idx: If provided, only applies weighting to this specific gate in the sequence.
 
         Returns:
             Contour weight q_c for the cost function.
         """
         q_c = self._q_nom
-        for gate in self.gates:
+
+        if target_gate_idx is not None and 0 <= target_gate_idx < len(self.gates):
+            # Only calculate weighting for the next gate the drone actually has to pass
+            gate = self.gates[target_gate_idx]
             dist_sq = np.sum((position - gate["pos"]) ** 2)
             q_c += self._q_wp * np.exp(-0.5 * dist_sq / self._sigma_sq)
+        else:
+            # Fallback: behavior for all gates if no target is specified
+            for gate in self.gates:
+                dist_sq = np.sum((position - gate["pos"]) ** 2)
+                q_c += self._q_wp * np.exp(-0.5 * dist_sq / self._sigma_sq)
+
         return float(q_c)
 
     def get_obstacle_parameters(self) -> np.ndarray:
