@@ -1,9 +1,9 @@
 # mpcc_config.yaml
 # Optimized parameters from TuRBO optimization run
-Q_c: 10
-Q_l: 1
-R_u: 1000.00
-mu: 0.19
-R_T: 1.00
-Z_l: 3.16e+05
-z_l: 6.17e+03
+Q_c: 20
+Q_l: 5
+R_u: 100.00
+mu: 1.0
+R_T: 5.00
+Z_l: 4e+03
+z_l: 4e+03

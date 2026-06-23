@@ -179,9 +179,11 @@ def evaluate_robust(
 
     tqdm.write(
         f"\n--- Robust Eval [{num_envs} tracks] ---\n"
-        f"Params: [Q_c:{p[0]:.0f}, Q_l:{p[1]:.0f}, R_u:{p[2]:.0f}, mu:{p[3]:.2f}, R_T:{p[4]:.0f}, Z_l:{Z_l_val:.1e}, z_l:{z_l_val:.1e}]\n"
-        f"Mean Reward: {mean_reward:.2f} | Worst: {min_reward:.2f} | Finishes: {success_rate * 100:.0f}%\n"
-        f"-----------------------------"
+        f"Params: [Q_c:{p[0]:.0f}, Q_l:{p[1]:.0f}, R_u:{p[2]:.0f}, "
+        f"mu:{p[3]:.2f}, R_T:{p[4]:.0f}, Z_l:{Z_l_val:.1e}, z_l:{z_l_val:.1e}]\n"
+        f"Mean Reward: {mean_reward:.2f} | Worst: {min_reward:.2f} | "
+        f"Finishes: {success_rate * 100:.0f}%\n"
+        "-----------------------------"
     )
 
     return {

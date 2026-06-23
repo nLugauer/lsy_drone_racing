@@ -16,3 +16,22 @@
    * come up with expression and proof
    * Downside: could be to conservative...
      * -> is there a thin like stochastic feasible sets for tuning conservatism with aggressiveness? 
+
+
+
+
+Problem with trajectory planner:
+* sometimes exits the allowed area (room boundaries in toml)
+* slow startup, I think its coming from mpcc
+* no obstacle detection for gate-stand, some nasty tracks will fly under
+* spline artifacts when replanning
+* whats v_theta?:
+   ```
+           yref_target[8] = (
+            5.0  # Target progress speed (v_theta), matches state constraint upper bound
+        )
+   ```
+
+* does often get stuck at obstacles: gradient better
+* 
+

@@ -114,10 +114,7 @@ class TrajectoryPlanner:
         return np.array(pts, dtype=np.float64)
 
     def rebuild(
-        self,
-        start_pos: np.ndarray,
-        gates_pos: np.ndarray,
-        gate_rpys: np.ndarray | None = None,
+        self, start_pos: np.ndarray, gates_pos: np.ndarray, gate_rpys: np.ndarray | None = None
     ) -> None:
         """Rebuild the spline in-place with updated gate positions.
 

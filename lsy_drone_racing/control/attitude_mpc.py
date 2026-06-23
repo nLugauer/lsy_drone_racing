@@ -223,13 +223,13 @@ def create_ocp_solver(
     ocp.model.cost_y_expr_e = ocp.model.cost_y_expr_e
 
     # Set State Constraints (roll/pitch/yaw and forward progress velocity)
-    ocp.constraints.lbx = np.array([-1, -1, -1.0, 0.0])
-    ocp.constraints.ubx = np.array([1, 1, 1.0, 3.0])   # v_θ capped at 3 m/s
+    ocp.constraints.lbx = np.array([-2.0, -2.0, -2.0, 0.0])
+    ocp.constraints.ubx = np.array([2.0, 2.0, 2.0, 5.0])  # v_θ capped at 5 m/s
     ocp.constraints.idxbx = np.array([3, 4, 5, 14])
 
     # Set Input Constraints (roll/pitch/thrust and virtual acceleration a_theta)
-    ocp.constraints.lbu = np.array([-1, -1, -1.0, parameters["thrust_min"] * 4, 0.01])
-    ocp.constraints.ubu = np.array([1, 1, 1.0, parameters["thrust_max"] * 4, 3.0])
+    ocp.constraints.lbu = np.array([-2.0, -2.0, -2.0, parameters["thrust_min"] * 4, 0.01])
+    ocp.constraints.ubu = np.array([2.0, 2.0, 2.0, parameters["thrust_max"] * 4, 5.0])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -331,7 +331,7 @@ class AttitudeMPC(Controller):
         self._log_q_c = []
         self.last_solver_status = 0
 
-        self._obstacle_manager = ObstacleManager(safety_margin=0.14)
+        self._obstacle_manager = ObstacleManager(safety_margin=0.08)
 
         # Resolve the initial track layout. Two separate cases, because level 3 hides the real
         # layout from the config file:
@@ -366,15 +366,20 @@ class AttitudeMPC(Controller):
             elif "gates_pos" in obs:
                 gate_positions = np.array(obs["gates_pos"], dtype=np.float64).reshape(-1, 3)
             else:
-                gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
+                gate_positions = np.array(
+                    [g["pos"] for g in config.env.track.gates], dtype=np.float64
+                )
 
             if "gates_quat" in info:
                 gate_quats = np.array(info["gates_quat"], dtype=np.float64).reshape(-1, 4)
             elif "gates_quat" in obs:
                 gate_quats = np.array(obs["gates_quat"], dtype=np.float64).reshape(-1, 4)
             else:
-                gate_quats = np.array([R.from_euler("xyz", g["rpy"]).as_quat() for g in config.env.track.gates], dtype=np.float64)
-            
+                gate_quats = np.array(
+                    [R.from_euler("xyz", g["rpy"]).as_quat() for g in config.env.track.gates],
+                    dtype=np.float64,
+                )
+
             gate_rpys = R.from_quat(gate_quats).as_euler("xyz")
 
             if "obstacles_pos" in info:
@@ -399,7 +404,8 @@ class AttitudeMPC(Controller):
         # Sanity guard: in a real randomized track the gates are spread out (>= ~1 m apart). If two
         # or more loaded gate centers coincide in xy, the observation handed us origin placeholders
         # instead of the real layout (e.g. the running env predates the level-3 obs fix), and any
-        # plan built now would squiggle at the origin. Surface that loudly instead of failing silently.
+        # plan built now would squiggle at the origin.
+        #  Surface that loudly instead of failing silently.
         if len(gate_positions) > 1:
             xy = gate_positions[:, :2]
             dmat = np.linalg.norm(xy[:, None, :] - xy[None, :, :], axis=-1)
@@ -416,7 +422,7 @@ class AttitudeMPC(Controller):
                     f"       loaded gate xy =\n{np.array2string(gate_positions, precision=3)}\n"
                     f"       env randomize.py actually loaded from: {_rz.__file__}\n"
                     f"       that env file has the #91 nominal-layout fix: {has_fix}\n"
-                    "       -> if False, your interpreter is importing an outdated lsy_drone_racing; "
+                    "      -> if False, your interpreter is importing an outdated lsy_drone_racing;"
                     "reinstall/point it at this repo so obs exposes all gate positions at reset."
                 )
 
@@ -430,7 +436,7 @@ class AttitudeMPC(Controller):
             # LOCAL replan horizon the last in-window gate is mid-track, so this matters on every
             # replan, not only at the finish. tail_extension is captured in the planner's tuning
             # snapshot, so async replans (_spawn) inherit the same value automatically.
-            v_max = 3.0
+            v_max = 5.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
             # The initial plan routes through ALL gates, so exclude every gate's own frame from the
             # PMM's collision pruning (we MUST fly through those openings); poles still block. The
@@ -443,9 +449,9 @@ class AttitudeMPC(Controller):
                 obstacle_manager=self._obstacle_manager.snapshot(
                     exclude_gate_centers=gate_positions
                 ),
-                u_max=10.0,
+                u_max=5.0,
                 v_max=v_max,
-                n_vel_samples=25,  # offline initial plan: more samples -> better global racing line
+                n_vel_samples=100,  # offline initial plan: more samples -> better global line
                 tail_extension=tail_extension,
             )
         else:
@@ -464,7 +470,10 @@ class AttitudeMPC(Controller):
             mpcc_tune = getattr(config, "mpcc_tune", {})
             config_file = getattr(config, "mpcc_config_file", None)
 
-        # Stage 1: Check for an external config file path or fallback to default 'mpcc_config.yaml'
+        # Stage 1: Check for an external config file path or fallback to local 'mpcc_config.yaml'
+        current_module_dir = os.path.dirname(os.path.abspath(__file__))
+        local_yaml_path = os.path.join(current_module_dir, "mpcc_config.yaml")
+
         if config_file and os.path.exists(config_file):
             try:
                 with open(config_file, "r") as f:
@@ -475,13 +484,13 @@ class AttitudeMPC(Controller):
                 print(f"Loaded MPCC configuration from file: {config_file}")
             except Exception as e:
                 print(f"Failed to parse config file {config_file}: {e}")
-        elif os.path.exists("mpcc_config.yaml"):
+        elif os.path.exists(local_yaml_path):
             try:
-                with open("mpcc_config.yaml", "r") as f:
+                with open(local_yaml_path, "r") as f:
                     mpcc_params = yaml.safe_load(f) or {}
-                print("Loaded optimized parameters from default 'mpcc_config.yaml'")
+                print(f"Loaded optimized parameters from local file: {local_yaml_path}")
             except Exception as e:
-                print(f"Failed to parse default mpcc_config.yaml: {e}")
+                print(f"Failed to parse local mpcc_config.yaml: {e}")
 
         # Stage 2: Merge or override from direct `config.mpcc_tune` if it exists
         if mpcc_tune:
@@ -502,7 +511,6 @@ class AttitudeMPC(Controller):
                 self.drone_params[k] = (
                     float(v) if isinstance(v, (int, float, str)) and not isinstance(v, bool) else v
                 )
-        # ------------------------------------------------------------------
 
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, self._obstacle_manager
@@ -552,20 +560,20 @@ class AttitudeMPC(Controller):
         # Online replans use fewer velocity samples than the offline initial plan (25): with the
         # ~M^2 graph cost, 12 keeps a 2-gate replan at ~150-200 ms so it lands before going stale,
         # while the initial plan can afford more samples for a better global line.
-        self._replan_vel_samples = 12
+        self._replan_vel_samples = 30
         self._replan_gate_move = 0.03  # [m] observed gate shift that triggers a replan
         # Robustness: commit the near-field on replans. A replan only changes the path BEYOND this
         # look-ahead distance on the current trajectory; the segment in between is kept identical
         # so adoption never jumps the MPCC's immediate reference. Smaller = more reactive to a
         # newly revealed gate; larger = smoother. Keep it below the sensor range (0.7 m).
-        self._commit_distance = 0.5
+        self._commit_distance = 0.3
         # Minimum approach room [m] left in front of the target gate when committing the near-field
         # on a replan. Must be large enough for the PMM to swing its velocity onto the gate's +x
         # crossing direction after a position reveal. Too small (e.g. 0.1) forces the planner to
         # re-thread a freshly revealed, laterally shifted gate within a fraction of a metre while
         # still carrying near-full speed -> with bounded acceleration it overshoots and curls back,
         # producing the visible loop right before the gate.
-        self._gate_approach_margin = 0.5
+        self._gate_approach_margin = 0.9
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -631,7 +639,9 @@ class AttitudeMPC(Controller):
 
         yref_target = np.zeros((self._ny,))
         yref_target[7] = self.drone_params["mass"] * 9.81  # Hover thrust
-        yref_target[8] = 3.0  # Target progress speed (v_theta), matches state constraint upper bound
+        yref_target[8] = (
+            5.0  # Target progress speed (v_theta), matches state constraint upper bound
+        )
 
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref_target)
@@ -684,15 +694,19 @@ class AttitudeMPC(Controller):
             # Phase 4b: steer the progress speed v_theta toward the PMM's time-optimal speed
             # at this point on the path (fast on straights, slower into tight turns) instead of
             # the constant target above. Only the PMM planner exposes a speed profile; the
-            # legacy spline keeps the constant target. Clip to the v_theta state bound (= 3 m/s).
+            # legacy spline keeps the constant target. Clip to the v_theta state bound (= 5 m/s).
             if self.USE_PMM_PLANNER:
                 yref_j = yref_target.copy()
-                yref_j[8] = float(np.clip(self._trajectory.evaluate_speed(theta_pred), 0.5, yref_target[8]))
+                yref_j[8] = float(
+                    np.clip(self._trajectory.evaluate_speed(theta_pred), 0.5, yref_target[8])
+                )
                 self._acados_ocp_solver.set(j, "yref", yref_j)
 
         # Set parameters for the terminal node (N): extrapolate theta one more step
         xN_prev = self._acados_ocp_solver.get(self._N, "x")
-        theta_N = float(np.clip(xN_prev[13], self._trajectory.knot_points[0], self._trajectory.knot_points[-1]))
+        theta_N = float(
+            np.clip(xN_prev[13], self._trajectory.knot_points[0], self._trajectory.knot_points[-1])
+        )
         px_N, py_N, pz_N, theta_offset_N = self._trajectory.get_polynomial_coeffs_at(theta_N)
         pos_N = self._trajectory.evaluate(theta_N)
         q_c_N = self._obstacle_manager.dynamic_contour_weight(pos_N)
@@ -806,7 +820,8 @@ class AttitudeMPC(Controller):
                 self._needs_warm_start_reset = True  # previous warm start was for the old path
                 logger.info(
                     "REPLAN adopted: target_gate=%d, path_len=%.2f m",
-                    target, self._trajectory.total_length,
+                    target,
+                    self._trajectory.total_length,
                 )
             else:
                 # discard the reversing plan and keep flying the current (forward) plan
@@ -817,7 +832,8 @@ class AttitudeMPC(Controller):
             # target (target != self._planned_target).
             logger.warning(
                 "REPLAN discarded: stale (built for gate %d, current target %d)",
-                self._planned_target, target,
+                self._planned_target,
+                target,
             )
 
         if target < 0:
@@ -840,7 +856,12 @@ class AttitudeMPC(Controller):
         reason = "target_advance" if target != self._planned_target else f"gate_moved={moved:.3f}m"
         logger.info(
             "REPLAN trigger @tick=%d: reason=%s, target_gate=%d, window=[%d:%d] (%d gate[s])",
-            self._tick, reason, target, window.start, window.stop, window.stop - window.start,
+            self._tick,
+            reason,
+            target,
+            window.start,
+            window.stop,
+            window.stop - window.start,
         )
 
         # Commit the near-field: the replan changes the path only BEYOND a short look-ahead on
@@ -906,8 +927,13 @@ class AttitudeMPC(Controller):
         planner = self._trajectory  # captured by the closure; _spawn reuses its tuning
         self._replanner.request(
             lambda: planner._spawn(
-                start_pos, horizon_gates, horizon_rpys, start_vel, obs_snapshot,
-                committed_pts=committed_pts, committed_speeds=committed_speeds,
+                start_pos,
+                horizon_gates,
+                horizon_rpys,
+                start_vel,
+                obs_snapshot,
+                committed_pts=committed_pts,
+                committed_speeds=committed_speeds,
                 committed_suffix_pts=committed_suffix_pts,
                 committed_suffix_speeds=committed_suffix_speeds,
                 n_vel_samples=self._replan_vel_samples,
@@ -991,7 +1017,7 @@ class AttitudeMPC(Controller):
 
     def episode_callback(self):
         """Plot MPCC telemetry metrics and reset the integral error."""
-        plotting = False
+        plotting = True
         if plotting is True:
             hover_thrust = self.drone_params["mass"] * 9.81
             max_thrust = self.drone_params["thrust_max"] * 4

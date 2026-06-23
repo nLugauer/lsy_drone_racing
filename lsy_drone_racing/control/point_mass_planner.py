@@ -34,13 +34,16 @@ import heapq
 import logging
 import threading
 import time
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import CubicSpline
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from lsy_drone_racing.control.obstacle_manager import ObstacleManager
 
 # Shared logger for the whole PMM stack (planner + the controller's replan trigger).
@@ -48,6 +51,102 @@ if TYPE_CHECKING:
 #     logging.getLogger("lsy_drone_racing.pmm").setLevel(logging.DEBUG)
 # INFO gives one line per plan (timing, cost, fallback); DEBUG adds graph/sampling/primitive detail.
 logger = logging.getLogger("lsy_drone_racing.pmm")
+
+
+def _jax_edge_cost_base(
+    p0: jax.Array, v0: jax.Array, pf: jax.Array, vf: jax.Array, u_max: jax.Array, v_cap: jax.Array
+) -> jax.Array:
+    """Computes T* for a single edge across all 3 axes simultaneously.
+
+    Returns jnp.inf if the edge is dynamically unfeasible.
+    """
+    dp = pf - p0
+
+    def _solve_axis(
+        dp_ax: jax.Array,
+        v0_ax: jax.Array,
+        vf_ax: jax.Array,
+        u_max_ax: jax.Array,
+        v_cap_ax: jax.Array,
+    ) -> jax.Array:
+        # 2 possible bang-bang sequences: (+u, -u) and (-u, +u)
+        a1_seq = jnp.array([u_max_ax, -u_max_ax])
+        a2_seq = jnp.array([-u_max_ax, u_max_ax])
+
+        A = a1_seq * (a2_seq - a1_seq) / (2.0 * a2_seq)
+        B = v0_ax * (a2_seq - a1_seq) / a2_seq
+        C = (vf_ax**2 - v0_ax**2) / (2.0 * a2_seq) - dp_ax
+
+        disc = B**2 - 4.0 * A * C
+        valid_disc = disc >= 0.0
+        sq = jnp.sqrt(jnp.maximum(disc, 0.0))
+
+        # 4 candidate roots for t1 (2 sequences * 2 quadratic roots)
+        t1_cands = jnp.array(
+            [
+                (-B[0] + sq[0]) / (2.0 * A[0]),
+                (-B[0] - sq[0]) / (2.0 * A[0]),
+                (-B[1] + sq[1]) / (2.0 * A[1]),
+                (-B[1] - sq[1]) / (2.0 * A[1]),
+            ]
+        )
+        valid_disc_cands = jnp.array([valid_disc[0], valid_disc[0], valid_disc[1], valid_disc[1]])
+        a1_cands = jnp.array([a1_seq[0], a1_seq[0], a1_seq[1], a1_seq[1]])
+        a2_cands = jnp.array([a2_seq[0], a2_seq[0], a2_seq[1], a2_seq[1]])
+
+        # Calculate corresponding t2
+        t2_cands = (vf_ax - v0_ax - a1_cands * t1_cands) / a2_cands
+
+        # Bang-Bang valid if both times are non-negative (with -1e-4 float32 tolerance)
+        valid_bb = valid_disc_cands & (t1_cands >= -1e-4) & (t2_cands >= -1e-4)
+
+        t1_cands = jnp.maximum(t1_cands, 0.0)
+        t2_cands = jnp.maximum(t2_cands, 0.0)
+
+        T_bb = jnp.where(valid_bb, t1_cands + t2_cands, jnp.inf)
+
+        # Bang-Singular-Bang (Velocity Capped)
+        v_peak = v0_ax + a1_cands * t1_cands
+        needs_cap = valid_bb & (jnp.abs(v_peak) > v_cap_ax)
+
+        v_sat = jnp.sign(v_peak) * v_cap_ax
+        v_sat_safe = jnp.where(jnp.abs(v_sat) < 1e-6, 1e-6, v_sat)  # Prevent div by zero
+
+        a_acc = jnp.where(v_sat >= v0_ax, u_max_ax, -u_max_ax)
+        a_dec = jnp.where(vf_ax >= v_sat, u_max_ax, -u_max_ax)
+
+        t1_c = (v_sat - v0_ax) / a_acc
+        t3_c = (vf_ax - v_sat) / a_dec
+        d1 = (v_sat**2 - v0_ax**2) / (2.0 * a_acc)
+        d3 = (vf_ax**2 - v_sat**2) / (2.0 * a_dec)
+        t2_c = (dp_ax - d1 - d3) / v_sat_safe
+
+        valid_cap = (t1_c >= -1e-4) & (t2_c >= -1e-4) & (t3_c >= -1e-4)
+        T_cap = jnp.where(
+            valid_cap,
+            jnp.maximum(t1_c, 0.0) + jnp.maximum(t2_c, 0.0) + jnp.maximum(t3_c, 0.0),
+            jnp.inf,
+        )
+
+        # Choose capped if needed, otherwise bang-bang
+        T_opts = jnp.where(needs_cap, T_cap, T_bb)
+
+        # Return the minimum feasible time across all 4 candidate paths
+        return jnp.min(T_opts)
+
+    # Vectorize across the 3 spatial axes
+    T_axes = jax.vmap(_solve_axis)(dp, v0, vf, u_max, v_cap)
+    return jnp.max(T_axes)
+
+
+# 1. Inner vmap: Map over Layer B (pf, vf)
+_jax_edge_cost_inner = jax.vmap(_jax_edge_cost_base, in_axes=(None, None, 0, 0, None, None))
+
+# 2. Outer vmap: Map over Layer A (p0, v0)
+_jax_edge_cost_vmap = jax.vmap(_jax_edge_cost_inner, in_axes=(0, 0, None, None, None, None))
+
+# 3. JIT compile the fully batched function for the GPU
+_jax_edge_cost = jax.jit(_jax_edge_cost_vmap)
 
 
 # ----------------------------------------------------------------------------------------
@@ -247,6 +346,7 @@ class MotionPrimitive:
         u_max: np.ndarray,
         v_max: np.ndarray | None = None,
     ) -> None:
+        """Compute a time-optimal primitive between (p0, v0) and (pf, vf)."""
         p0 = np.asarray(p0, dtype=np.float64)
         v0 = np.asarray(v0, dtype=np.float64)
         pf = np.asarray(pf, dtype=np.float64)
@@ -257,8 +357,7 @@ class MotionPrimitive:
         # Per-axis minimum times, then T* = max so all axes finish simultaneously.
         full = [
             min_time_1d(
-                p0[k], v0[k], pf[k], vf[k], -u_max[k], u_max[k],
-                None if v_cap is None else v_cap[k],
+                p0[k], v0[k], pf[k], vf[k], -u_max[k], u_max[k], None if v_cap is None else v_cap[k]
             )
             for k in range(3)
         ]
@@ -272,7 +371,13 @@ class MotionPrimitive:
                 self.axes.append(full[k])
             else:
                 ax = fixed_time_1d(
-                    p0[k], v0[k], pf[k], vf[k], -u_max[k], u_max[k], self.T,
+                    p0[k],
+                    v0[k],
+                    pf[k],
+                    vf[k],
+                    -u_max[k],
+                    u_max[k],
+                    self.T,
                     None if v_cap is None else v_cap[k],
                 )
                 self.axes.append(ax)
@@ -293,7 +398,9 @@ class MotionPrimitive:
 # ----------------------------------------------------------------------------------------
 # Phase 3: Sampling-based receding-horizon graph search (Sec. VI-B)
 # ----------------------------------------------------------------------------------------
-def _cone_directions(rng: np.random.Generator, axis: np.ndarray, half_angle: float, n: int) -> np.ndarray:
+def _cone_directions(
+    rng: np.random.Generator, axis: np.ndarray, half_angle: float, n: int
+) -> np.ndarray:
     """Sample n unit vectors uniformly within ``half_angle`` of ``axis``."""
     axis = axis / (np.linalg.norm(axis) + 1e-12)
     # Orthonormal basis (e1, e2) spanning the plane perpendicular to axis.
@@ -343,8 +450,9 @@ class _GraphPlanner:
         speed_lo = speed_lo_frac * v_mag
 
         # Layer 0: the (single) start state. Layers 1..G: sampled velocities at each gate.
-        self.layers: list[list[dict]] = [[{"pos": np.asarray(start_pos, float),
-                                           "vel": np.asarray(start_vel, float)}]]
+        self.layers: list[list[dict]] = [
+            [{"pos": np.asarray(start_pos, float), "vel": np.asarray(start_vel, float)}]
+        ]
         for c, nrm in zip(gate_centers, gate_normals):
             states = [{"pos": c.copy(), "vel": nrm * (0.5 * (speed_lo + v_mag))}]  # nominal sample
             if n_samples > 1:
@@ -358,8 +466,11 @@ class _GraphPlanner:
             spd = [float(np.linalg.norm(s["vel"])) for layer in self.layers[1:] for s in layer]
             logger.debug(
                 "sampling: %d gate(s) x %d samples/gate; |v| in [%.2f, %.2f] m/s, phi_max=%.0f deg",
-                len(gate_centers), n_samples,
-                min(spd) if spd else 0.0, max(spd) if spd else 0.0, np.rad2deg(phi_max),
+                len(gate_centers),
+                n_samples,
+                min(spd) if spd else 0.0,
+                max(spd) if spd else 0.0,
+                np.rad2deg(phi_max),
             )
 
     def _edge_ok(self, prim: MotionPrimitive) -> bool:
@@ -370,7 +481,6 @@ class _GraphPlanner:
 
     def solve(self) -> list[MotionPrimitive] | None:
         """Return the minimum-time list of primitives through all gates, or None."""
-        # Flatten nodes; assign a global id. Build a virtual sink after the last gate layer.
         node_ids: dict[tuple[int, int], int] = {}
         nodes: list[dict] = []
         for li, layer in enumerate(self.layers):
@@ -379,71 +489,88 @@ class _GraphPlanner:
                 nodes.append(st)
         sink = len(nodes)
 
-        # Adjacency with the connecting primitive stored on each edge.
-        adj: list[list[tuple[int, float, MotionPrimitive | None]]] = [[] for _ in range(sink + 1)]
-        n_edges = n_rej_collision = n_rej_infeasible = 0
+        adj: list[list[tuple[int, float]]] = [[] for _ in range(sink + 1)]
+        u_max_jnp = jnp.array(self.u_max)
+        v_cap_jnp = jnp.array(self.v_axis_cap)
+
+        n_edges = n_rej_infeasible = 0
+
+        # Batched cost evaluation
         for li in range(len(self.layers) - 1):
-            for ai, a in enumerate(self.layers[li]):
+            layer_A = self.layers[li]
+            layer_B = self.layers[li + 1]
+
+            pA = jnp.array([a["pos"] for a in layer_A])
+            vA = jnp.array([a["vel"] for a in layer_A])
+            pB = jnp.array([b["pos"] for b in layer_B])
+            vB = jnp.array([b["vel"] for b in layer_B])
+
+            # Massive parallel execution on the GPU
+            cost_matrix_gpu = _jax_edge_cost(pA, vA, pB, vB, u_max_jnp, v_cap_jnp)
+
+            # TRANSFER THE ENTIRE MATRIX TO CPU RAM ONCE (Zero PCIe Bottleneck)
+            cost_matrix_cpu = np.array(cost_matrix_gpu)
+
+            for ai, a in enumerate(layer_A):
                 ua = node_ids[(li, ai)]
-                for bi, b in enumerate(self.layers[li + 1]):
-                    prim = MotionPrimitive(
-                        a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.v_axis_cap
-                    )
-                    if not np.isfinite(prim.T):
+                for bi, b in enumerate(layer_B):
+                    # Fast CPU-local RAM access
+                    T_star = float(cost_matrix_cpu[ai, bi])
+
+                    if not np.isfinite(T_star):
                         n_rej_infeasible += 1
                         continue
-                    if not self._edge_ok(prim):
-                        n_rej_collision += 1
-                        continue
                     n_edges += 1
-                    adj[ua].append((node_ids[(li + 1, bi)], prim.T, prim))
+                    adj[ua].append((node_ids[(li + 1, bi)], T_star))
+
         last = len(self.layers) - 1
         for ni in range(len(self.layers[last])):
-            adj[node_ids[(last, ni)]].append((sink, 0.0, None))
+            adj[node_ids[(last, ni)]].append((sink, 0.0))
 
-        # Dijkstra from the start node (0) to the sink.
+        # Dijkstra on scalar costs
         dist = [np.inf] * (sink + 1)
-        prev: list[tuple[int, MotionPrimitive | None] | None] = [None] * (sink + 1)
+        prev: list[int | None] = [None] * (sink + 1)
         dist[0] = 0.0
         pq = [(0.0, 0)]
+
         while pq:
             d, u = heapq.heappop(pq)
             if d > dist[u] + 1e-12:
                 continue
             if u == sink:
                 break
-            for v, w, prim in adj[u]:
+            for v, w in adj[u]:
                 nd = d + w
                 if nd < dist[v] - 1e-12:
                     dist[v] = nd
-                    prev[v] = (u, prim)
+                    prev[v] = u
                     heapq.heappush(pq, (nd, v))
-
-        self.stats = {
-            "nodes": len(nodes),
-            "edges": n_edges,
-            "rejected_collision": n_rej_collision,
-            "rejected_infeasible": n_rej_infeasible,
-            "cost": float(dist[sink]),
-        }
-        logger.debug(
-            "graph: %d nodes, %d edges kept, %d rejected (collision=%d, infeasible=%d), best T=%.3fs",
-            len(nodes), n_edges, n_rej_collision + n_rej_infeasible,
-            n_rej_collision, n_rej_infeasible, dist[sink],
-        )
 
         if not np.isfinite(dist[sink]):
             return None
 
-        # Reconstruct primitive sequence (skip the zero-weight sink edge).
+        self.stats = {"nodes": len(nodes), "edges": n_edges, "cost": float(dist[sink])}
+
+        # Reconstruct path and ONLY evaluate full primitives for the optimal route
         prims: list[MotionPrimitive] = []
-        cur = sink
-        while prev[cur] is not None:
-            u, prim = prev[cur]
-            if prim is not None:
-                prims.append(prim)
-            cur = u
-        prims.reverse()
+        cur = prev[sink]
+        path_nodes = []
+        while cur is not None:
+            path_nodes.append(cur)
+            cur = prev[cur]
+        path_nodes.reverse()
+
+        for i in range(len(path_nodes) - 1):
+            a = nodes[path_nodes[i]]
+            b = nodes[path_nodes[i + 1]]
+            prim = MotionPrimitive(
+                a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.v_axis_cap
+            )
+            # Lazy collision check on the optimal path only
+            if not self._edge_ok(prim):
+                return None  # Path violates obstacles, trigger fallback
+            prims.append(prim)
+
         return prims
 
 
@@ -481,6 +608,7 @@ class PointMassPlanner:
         committed_suffix_pts: np.ndarray | None = None,
         committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
+        """Initialize the PMM planner and run the first plan."""
         self._u_max = np.full(3, float(u_max)) if np.isscalar(u_max) else np.asarray(u_max, float)
         # v_max is the maximum SPEED (velocity norm). It is used both as the per-axis velocity
         # cap inside the motion primitives and as the largest speed sampled at gates. Kept as a
@@ -506,16 +634,29 @@ class PointMassPlanner:
 
         # Tuning snapshot so the async replanner can spawn an identically-configured planner.
         self._kwargs = dict(
-            u_max=self._u_max, v_max=self._v_max, n_vel_samples=self._n_vel_samples,
-            phi_max=self._phi_max, speed_lo_frac=self._speed_lo_frac,
-            n_eval_points=self._n_eval_points, n_path_samples_per_seg=self._n_path_samples,
-            n_collision_pts=self._n_collision_pts, collision_margin=self._collision_margin,
-            min_z=self._min_z, tail_extension=self._tail, seed=self._seed,
+            u_max=self._u_max,
+            v_max=self._v_max,
+            n_vel_samples=self._n_vel_samples,
+            phi_max=self._phi_max,
+            speed_lo_frac=self._speed_lo_frac,
+            n_eval_points=self._n_eval_points,
+            n_path_samples_per_seg=self._n_path_samples,
+            n_collision_pts=self._n_collision_pts,
+            collision_margin=self._collision_margin,
+            min_z=self._min_z,
+            tail_extension=self._tail,
+            seed=self._seed,
         )
 
         self.plan(
-            start_pos, gates_pos, gate_rpys, start_vel, committed_pts, committed_speeds,
-            committed_suffix_pts, committed_suffix_speeds,
+            start_pos,
+            gates_pos,
+            gate_rpys,
+            start_vel,
+            committed_pts,
+            committed_speeds,
+            committed_suffix_pts,
+            committed_suffix_speeds,
         )
 
     # -- planning -------------------------------------------------------------------------
@@ -544,19 +685,23 @@ class PointMassPlanner:
         [prefix from current path] + [primitives through the window gates] + [backbone suffix].
         """
         self._committed_pts = (
-            None if committed_pts is None
+            None
+            if committed_pts is None
             else np.asarray(committed_pts, dtype=np.float64).reshape(-1, 3)
         )
         self._committed_speeds = (
-            None if committed_speeds is None
+            None
+            if committed_speeds is None
             else np.asarray(committed_speeds, dtype=np.float64).reshape(-1)
         )
         self._committed_suffix_pts = (
-            None if committed_suffix_pts is None
+            None
+            if committed_suffix_pts is None
             else np.asarray(committed_suffix_pts, dtype=np.float64).reshape(-1, 3)
         )
         self._committed_suffix_speeds = (
-            None if committed_suffix_speeds is None
+            None
+            if committed_suffix_speeds is None
             else np.asarray(committed_suffix_speeds, dtype=np.float64).reshape(-1)
         )
         start_pos = np.asarray(start_pos, dtype=np.float64)
@@ -575,7 +720,9 @@ class PointMassPlanner:
         has_prefix = self._committed_pts is not None and len(self._committed_pts) > 0
         logger.info(
             "plan START: gates=%d, M=%d, committed_prefix=%s",
-            len(centers), self._n_vel_samples, has_prefix,
+            len(centers),
+            self._n_vel_samples,
+            has_prefix,
         )
 
         prims, stats = self._run_graph(start_pos, start_vel, centers, normals, prune=True)
@@ -586,7 +733,9 @@ class PointMassPlanner:
             logger.warning(
                 "graph infeasible with pruning -> single-sample NO-COLLISION-CHECK fallback "
                 "(M=%d, phi=%.0f deg, gates=%d); path may clip obstacles",
-                self._n_vel_samples, np.rad2deg(self._phi_max), len(centers),
+                self._n_vel_samples,
+                np.rad2deg(self._phi_max),
+                len(centers),
             )
             prims, stats = self._run_graph(
                 start_pos, start_vel, centers, normals, prune=False, single=True
@@ -598,9 +747,14 @@ class PointMassPlanner:
         logger.info(
             "plan DONE: %.1f ms, prims=%d, len=%.2f m, |v| in [%.2f, %.2f] m/s, "
             "cost=%.3f s, cubic_axes=%d, fallback=%s",
-            1e3 * (time.perf_counter() - t0), len(prims or []), self._s_total,
-            float(self._speed_profile.min()), float(self._speed_profile.max()),
-            stats.get("cost", float("nan")), n_cubic, used_fallback,
+            1e3 * (time.perf_counter() - t0),
+            len(prims or []),
+            self._s_total,
+            float(self._speed_profile.min()),
+            float(self._speed_profile.max()),
+            stats.get("cost", float("nan")),
+            n_cubic,
+            used_fallback,
         )
 
     def rebuild(
@@ -689,7 +843,9 @@ class PointMassPlanner:
         has_prefix = self._committed_pts is not None and len(self._committed_pts) > 0
         if has_prefix:
             pts.extend(list(self._committed_pts))
-            if self._committed_speeds is not None and len(self._committed_speeds) == len(self._committed_pts):
+            if self._committed_speeds is not None and len(self._committed_speeds) == len(
+                self._committed_pts
+            ):
                 spd.extend([float(s) for s in self._committed_speeds])
             else:
                 spd.extend([self._v_max] * len(self._committed_pts))
@@ -703,7 +859,7 @@ class PointMassPlanner:
         elif not has_prefix:
             pts.append(np.zeros(3))
             spd.append(0.0)
-        for prim in prims:
+        for prim in prims or []:
             ts = np.linspace(0.0, prim.T, max(self._n_path_samples, 2))
             for t in ts[1:]:  # drop the shared joint point shared with the previous primitive
                 p, v = prim.state_at(t)
@@ -717,10 +873,9 @@ class PointMassPlanner:
         has_suffix = self._committed_suffix_pts is not None and len(self._committed_suffix_pts) > 0
         if has_suffix:
             pts.extend(list(self._committed_suffix_pts))
-            if (
-                self._committed_suffix_speeds is not None
-                and len(self._committed_suffix_speeds) == len(self._committed_suffix_pts)
-            ):
+            if self._committed_suffix_speeds is not None and len(
+                self._committed_suffix_speeds
+            ) == len(self._committed_suffix_pts):
                 spd.extend([float(s) for s in self._committed_suffix_speeds])
             else:
                 spd.extend([self._v_max] * len(self._committed_suffix_pts))
@@ -835,10 +990,15 @@ class PointMassPlanner:
         if n_vel_samples is not None:
             kwargs["n_vel_samples"] = int(n_vel_samples)
         return PointMassPlanner(
-            start_pos, gates_pos, gate_rpys, start_vel,
-            committed_pts=committed_pts, committed_speeds=committed_speeds,
+            start_pos,
+            gates_pos,
+            gate_rpys,
+            start_vel,
+            committed_pts=committed_pts,
+            committed_speeds=committed_speeds,
             committed_suffix_pts=committed_suffix_pts,
-            committed_suffix_speeds=committed_suffix_speeds, **kwargs,
+            committed_suffix_speeds=committed_suffix_speeds,
+            **kwargs,
         )
 
     def nearest_theta(self, pos: np.ndarray) -> float:
@@ -885,6 +1045,7 @@ class AsyncPMMReplanner:
     """
 
     def __init__(self) -> None:
+        """Initialize the async replanner (no plan is running yet)."""
         self._lock = threading.Lock()
         self._ready: PointMassPlanner | None = None
         self._busy = False
