@@ -374,7 +374,8 @@ class ObstacleManager:
 
         Args:
             position: Current drone position [x, y, z].
-            target_gate_idx: If provided, only applies weighting to this specific gate in the sequence.
+            target_gate_idx: If provided, only applies weighting to this specific
+            gate in the sequence.
 
         Returns:
             Contour weight q_c for the cost function.

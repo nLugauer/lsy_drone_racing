@@ -661,12 +661,28 @@ class AttitudeMPC(Controller):
         for j in range(self._N):
             if use_kinematic_guess:
                 # Provide a kinematic guess on first tick and after any trajectory rebuild.
-                # After a rebuild the old solution has theta values from the OLD path, which
-                # are inconsistent with the new spline and would corrupt the MPC parameters.
                 theta_pred = self._current_theta + j * self._dt * max(self._current_v_theta, 0.5)
+                theta_pred = float(
+                    np.clip(
+                        theta_pred,
+                        self._trajectory.knot_points[0],
+                        self._trajectory.knot_points[-1],
+                    )
+                )
+
                 xj_guess = x0_aug.copy()
+
+                # 1. Advance position along the path
+                xj_guess[0:3] = self._trajectory.evaluate(theta_pred)
+
+                # 2. Point velocity along the path tangent
+                t_ref = self._trajectory.evaluate_velocity(theta_pred)
+                t_norm = t_ref / (np.linalg.norm(t_ref) + 1e-6)
+                xj_guess[6:9] = t_norm * max(self._current_v_theta, 0.5)
+
                 xj_guess[13] = theta_pred
                 xj_guess[14] = max(self._current_v_theta, 0.5)
+
                 hover_u = np.array([0.0, 0.0, 0.0, self.drone_params["mass"] * 9.81, 0.0])
                 self._acados_ocp_solver.set(j, "x", xj_guess)
                 self._acados_ocp_solver.set(j, "u", hover_u)
@@ -953,17 +969,22 @@ class AttitudeMPC(Controller):
     def _reanchor_progress(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Re-fit the progress state (theta, v_theta) to the current trajectory after a swap.
 
-        theta is set to the arc length of the path point nearest the drone; v_theta to the
-        drone's real velocity projected onto the new path tangent (a retained v_theta could be
-        misaligned with the new path direction).
+        Uses a localized search near the start of the trajectory to prevent the reference
+        from snapping to future track segments if the path crosses over itself.
         """
-        self._current_theta = float(
-            np.clip(
-                self._trajectory.nearest_theta(obs["pos"]),
-                self._trajectory.knot_points[0],
-                self._trajectory.knot_points[-1],
-            )
-        )
+        knot_start = self._trajectory.knot_points[0]
+        knot_end = self._trajectory.knot_points[-1]
+
+        # Search only the first 3 meters of the new path to avoid crossover traps
+        search_limit = min(knot_start + 3.0, knot_end)
+        search_thetas = np.linspace(knot_start, search_limit, 60)
+
+        pts = self._trajectory.evaluate(search_thetas)
+        dists = np.linalg.norm(pts - obs["pos"], axis=1)
+        best_idx = np.argmin(dists)
+
+        self._current_theta = float(search_thetas[best_idx])
+
         t_new = self._trajectory.evaluate_velocity(self._current_theta)
         t_norm = t_new / (np.linalg.norm(t_new) + 1e-6)
         v_proj = float(np.dot(np.array(obs["vel"], dtype=np.float64), t_norm))
