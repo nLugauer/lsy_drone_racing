@@ -305,6 +305,14 @@ class AttitudeMPC(Controller):
     # toggle for A/B lap-time comparison.
     USE_PMM_PLANNER = True
 
+    # Online replanning toggle. True -> replan the reference as gate positions are revealed/refined
+    # (off-thread). False -> plan ONCE before takeoff (high sample count) and never touch the
+    # reference again; the MPCC alone tracks it and rejects disturbances. The obstacle manager is
+    # still updated every tick, so the MPCC's hard collision constraints always use LIVE positions
+    # even with replanning off -- only the reference centerline is frozen. Set False on this
+    # experimental branch to A/B plan-once vs replanning.
+    PMM_REPLAN = False
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
 
@@ -615,7 +623,10 @@ class AttitudeMPC(Controller):
             # the true center in Level 2, leaving only 0.05 m clearance — a near-certain crash.
             # The PMM planner replans OFF the control thread (Phase 4) so the 50 Hz loop never
             # stalls; the legacy spline planner keeps its original synchronous rebuild.
-            if gates_pos is not None:
+            # Replanning is gated by PMM_REPLAN. When off, the reference stays the single offline
+            # plan; the obstacle-manager updates above still ran, so the MPCC's constraints remain
+            # live. (This also removes the replan-induced theta/reference discontinuities.)
+            if gates_pos is not None and self.PMM_REPLAN:
                 if self.USE_PMM_PLANNER:
                     replan_rpys = gates_rpys if gates_yaw is not None else None
                     self._maybe_replan_pmm(obs, gates_pos, replan_rpys)
