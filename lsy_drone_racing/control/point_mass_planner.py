@@ -438,18 +438,30 @@ class _GraphPlanner:
         n_collision_pts: int,
         seed: int,
         collision_margin: float = 0.05,
+        gate_exit_dist: float = 0.3,
+        turn_penalty_weight: float = 0.3,
+        max_turn_angle: float = np.pi,
     ) -> None:
         self.u_max = u_max
         self.v_axis_cap = np.full(3, float(v_max))  # per-axis velocity cap for the primitives
         self.obs = obstacle_manager
         self.n_collision_pts = n_collision_pts
         self.collision_margin = float(collision_margin)
+        self.turn_penalty_weight = float(turn_penalty_weight)
+        self.max_turn_angle = float(max_turn_angle)
         rng = np.random.default_rng(seed)
 
         v_mag = float(v_max)  # largest sampled gate speed (as a norm)
         speed_lo = speed_lo_frac * v_mag
 
-        # Layer 0: the (single) start state. Layers 1..G: sampled velocities at each gate.
+        # Layer 0: the (single) start state. Then, per gate, TWO layers:
+        #   * a crossing layer at the gate centre (sampled velocities), and
+        #   * an EXIT layer a short distance behind the gate along each crossing's own direction
+        #     (improvement 2a). Forcing the path to reach a waypoint behind the gate makes it
+        #     continue straight THROUGH the opening instead of clipping the entrance and turning
+        #     away early, so the gate reliably counts as passed. The exit sample mirrors its
+        #     crossing sample's velocity, so the centre->exit edge is a straight, constant-velocity
+        #     segment (the cheapest, hence the one Dijkstra selects).
         self.layers: list[list[dict]] = [
             [{"pos": np.asarray(start_pos, float), "vel": np.asarray(start_vel, float)}]
         ]
@@ -460,6 +472,13 @@ class _GraphPlanner:
                 speeds = rng.uniform(speed_lo, v_mag, n_samples - 1)
                 states += [{"pos": c.copy(), "vel": d * s} for d, s in zip(dirs, speeds)]
             self.layers.append(states)
+
+            if gate_exit_dist > 0.0:
+                exit_states = []
+                for s in states:
+                    d = s["vel"] / (np.linalg.norm(s["vel"]) + 1e-9)
+                    exit_states.append({"pos": c + gate_exit_dist * d, "vel": s["vel"].copy()})
+                self.layers.append(exit_states)
 
         self.stats: dict = {}  # populated by solve(): node/edge/rejection counts, path cost
         if logger.isEnabledFor(logging.DEBUG):
@@ -510,6 +529,28 @@ class _GraphPlanner:
 
             # TRANSFER THE ENTIRE MATRIX TO CPU RAM ONCE (Zero PCIe Bottleneck)
             cost_matrix_cpu = np.array(cost_matrix_gpu)
+
+            # Improvement 2b: bias the search toward dynamically feasible (smooth) paths. For each
+            # candidate edge, penalize how far its endpoint velocities deviate from the straight
+            # chord pA->pB: a large deviation means the point-mass primitive bends sharply (small
+            # turn radius), which the real quadrotor tracks poorly. The metric is sample-dependent,
+            # so among the gate-crossing samples the planner prefers the smoothest feasible one,
+            # without ever forbidding a wide arc the track genuinely requires (e.g. between two
+            # gates that face opposite ways). The straight gate centre->exit edges deviate ~0, so
+            # they are unpenalized. Set max_turn_angle < pi to ALSO hard-reject edges that bend
+            # beyond it (use with care: it can disconnect tracks needing near-reversals).
+            PA = np.asarray([a["pos"] for a in layer_A], dtype=np.float64)
+            PB = np.asarray([b["pos"] for b in layer_B], dtype=np.float64)
+            VA = np.asarray([a["vel"] for a in layer_A], dtype=np.float64)
+            VB = np.asarray([b["vel"] for b in layer_B], dtype=np.float64)
+            uA = VA / (np.linalg.norm(VA, axis=1, keepdims=True) + 1e-9)
+            uB = VB / (np.linalg.norm(VB, axis=1, keepdims=True) + 1e-9)
+            chord = PB[None, :, :] - PA[:, None, :]  # (KA, KB, 3)
+            chord = chord / (np.linalg.norm(chord, axis=2, keepdims=True) + 1e-9)
+            ang_in = np.arccos(np.clip(np.einsum("ad,abd->ab", uA, chord), -1.0, 1.0))
+            ang_out = np.arccos(np.clip(np.einsum("bd,abd->ab", uB, chord), -1.0, 1.0))
+            cost_matrix_cpu = cost_matrix_cpu + self.turn_penalty_weight * (ang_in**2 + ang_out**2)
+            cost_matrix_cpu[np.maximum(ang_in, ang_out) > self.max_turn_angle] = np.inf
 
             for ai, a in enumerate(layer_A):
                 ua = node_ids[(li, ai)]
@@ -603,6 +644,9 @@ class PointMassPlanner:
         min_z: float = 0.15,
         tail_extension: float = 0.5,
         seed: int = 0,
+        gate_exit_dist: float = 0.3,
+        turn_penalty_weight: float = 0.3,
+        max_turn_angle: float = np.pi,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
         committed_suffix_pts: np.ndarray | None = None,
@@ -631,6 +675,11 @@ class PointMassPlanner:
         self._min_z = float(min_z)
         self._tail = float(tail_extension)
         self._seed = int(seed)
+        # Improvement 2a/2b tuning: straight through-gate exit waypoint distance, and the turn
+        # penalty / hard turn-angle cap that trade time-optimality for dynamic feasibility.
+        self._gate_exit_dist = float(gate_exit_dist)
+        self._turn_penalty_weight = float(turn_penalty_weight)
+        self._max_turn_angle = float(max_turn_angle)
 
         # Tuning snapshot so the async replanner can spawn an identically-configured planner.
         self._kwargs = dict(
@@ -646,6 +695,9 @@ class PointMassPlanner:
             min_z=self._min_z,
             tail_extension=self._tail,
             seed=self._seed,
+            gate_exit_dist=self._gate_exit_dist,
+            turn_penalty_weight=self._turn_penalty_weight,
+            max_turn_angle=self._max_turn_angle,
         )
 
         self.plan(
@@ -822,6 +874,9 @@ class PointMassPlanner:
             n_collision_pts=self._n_collision_pts,
             seed=self._seed,
             collision_margin=self._collision_margin,
+            gate_exit_dist=self._gate_exit_dist,
+            turn_penalty_weight=self._turn_penalty_weight,
+            max_turn_angle=self._max_turn_angle,
         )
         prims = gp.solve()
         return prims, gp.stats

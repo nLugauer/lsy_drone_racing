@@ -28,11 +28,20 @@ class ObstacleManager:
         self.safety_margin = safety_margin
         self.obstacles = []
         self.gates = []
-        self._gate_obstacle_indices = []
+        self._gate_obstacle_indices = []  # the 4 frame-capsule indices per gate (snapshot-excludable)
+        self._gate_lower_indices = []  # the lower-frame cylinder index per gate (never excluded)
+        self._gate_openings = []  # per-gate opening corridor: {center, axis, radius, half_depth}
         self._pole_obstacle_indices = []
         self._q_nom = 1.0
         self._q_wp = 300.0
         self._sigma_sq = 0.35**2
+
+        # Gate opening corridor (PMM planner pruning only — NOT the MPCC hard constraints): a short
+        # tube through each gate's opening that points_in_obstacles treats as free space even where
+        # the frame capsules' margin would otherwise flag it. This biases the planner to thread the
+        # opening instead of being repelled around the frame (improvement 2c).
+        self._opening_margin = 0.05  # [m] shrink the corridor radius in from the clear half-width
+        self._opening_half_depth = 0.25  # [m] half-length of the corridor along the gate normal
 
         # Adaptive contour weight: scale the per-gate q_c bump by how far a gate's revealed
         # position has moved from the nominal one the trajectory was planned through. Small
@@ -70,24 +79,10 @@ class ObstacleManager:
             }
         )
 
-    def add_gate(
-        self,
-        pos: list | np.ndarray,
-        rpy: list | np.ndarray,
-        inner_width: float = 0.4,
-        outer_width: float = 0.72,
-    ) -> None:
-        """Model a gate as 4 capsule obstacles representing the solid banner frame.
-
-        Args:
-            pos: [x, y, z] center position of the gate.
-            rpy: [roll, pitch, yaw] orientation in radians.
-            inner_width: Width/height of the opening (default 0.4m).
-            outer_width: Outer width/height of the frame (default 0.72m).
-        """
-        center = np.array(pos, dtype=np.float64)
-        yaw = rpy[2]
-
+    def _frame_capsules(
+        self, center: np.ndarray, yaw: float, inner_width: float, outer_width: float
+    ) -> list[dict]:
+        """Build the 4 capsule obstacles that model a gate's solid banner frame."""
         banner_offset = (inner_width / 4.0) + (outer_width / 4.0)
         thickness = (outer_width - inner_width) / 4.0
 
@@ -97,40 +92,71 @@ class ObstacleManager:
             np.array([0, banner_offset, -banner_offset]),
             np.array([0, -banner_offset, -banner_offset]),
         ]
-
         R = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
-        world_corners = [(R @ p) + center for p in local_corners]
+        wc = [(R @ p) + center for p in local_corners]
+        return [
+            {"type": "cylinder", "p1": wc[i], "p2": wc[(i + 1) % 4], "r": thickness, "kind": "gate_frame"}
+            for i in range(4)
+        ]
+
+    def _lower_cylinder(
+        self, center: np.ndarray, outer_width: float, radius: float
+    ) -> dict:
+        """Build the vertical cylinder modelling the solid structure below a gate's opening.
+
+        Spans from the ground up to the bottom edge of the outer frame (center_z - outer_width/2)
+        so the drone cannot fly *under* the gate; it must pass through the opening. The top is kept
+        below the opening on purpose: a capsule's spherical end-cap (radius + safety_margin) would
+        otherwise intrude into the opening and forbid the legitimate centered crossing.
+        """
+        z_top = max(float(center[2]) - outer_width / 2.0, 0.05)
+        return {
+            "type": "cylinder",
+            "p1": np.array([center[0], center[1], 0.0], dtype=np.float64),
+            "p2": np.array([center[0], center[1], z_top], dtype=np.float64),
+            "r": float(radius),
+            "kind": "gate_lower",
+        }
+
+    def _opening_corridor(self, center: np.ndarray, yaw: float, inner_width: float) -> dict:
+        """Free-space tube through a gate's opening (used only by PMM collision pruning)."""
+        axis = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float64)
+        return {
+            "center": np.array(center, dtype=np.float64),
+            "axis": axis,
+            "radius": max(inner_width / 2.0 - self._opening_margin, 0.05),
+            "half_depth": self._opening_half_depth,
+        }
+
+    def add_gate(
+        self,
+        pos: list | np.ndarray,
+        rpy: list | np.ndarray,
+        inner_width: float = 0.4,
+        outer_width: float = 0.72,
+        lower_frame_radius: float = 0.20,
+    ) -> None:
+        """Model a gate as 4 banner-frame capsules plus a lower-frame cylinder below the opening.
+
+        Args:
+            pos: [x, y, z] center position of the gate (z is the opening centre height).
+            rpy: [roll, pitch, yaw] orientation in radians.
+            inner_width: Width/height of the opening (default 0.4m).
+            outer_width: Outer width/height of the frame (default 0.72m).
+            lower_frame_radius: Radius of the vertical cylinder modelling the gate's solid lower
+                section/support below the opening (default 0.20m).
+        """
+        center = np.array(pos, dtype=np.float64)
+        yaw = float(rpy[2])
 
         start_idx = len(self.obstacles)
-        self.obstacles.extend(
-            [
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[0],
-                    "p2": world_corners[1],
-                    "r": thickness,
-                },
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[1],
-                    "p2": world_corners[2],
-                    "r": thickness,
-                },
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[2],
-                    "p2": world_corners[3],
-                    "r": thickness,
-                },
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[3],
-                    "p2": world_corners[0],
-                    "r": thickness,
-                },
-            ]
-        )
+        self.obstacles.extend(self._frame_capsules(center, yaw, inner_width, outer_width))
         self._gate_obstacle_indices.append(list(range(start_idx, start_idx + 4)))
+
+        self.obstacles.append(self._lower_cylinder(center, outer_width, lower_frame_radius))
+        self._gate_lower_indices.append(start_idx + 4)
+
+        self._gate_openings.append(self._opening_corridor(center, yaw, inner_width))
         self.gates.append(
             {
                 "pos": center,
@@ -141,6 +167,7 @@ class ObstacleManager:
                 "rpy": np.array(rpy, dtype=np.float64),
                 "inner_width": inner_width,
                 "outer_width": outer_width,
+                "lower_frame_radius": float(lower_frame_radius),
             }
         )
 
@@ -200,52 +227,22 @@ class ObstacleManager:
             new_rpy = gate_rpys_arr[gate_idx]
             inner_width = gate["inner_width"]
             outer_width = gate["outer_width"]
+            lower_radius = gate.get("lower_frame_radius", 0.20)
 
             center = np.array(new_pos, dtype=np.float64)
-            yaw = new_rpy[2]
+            yaw = float(new_rpy[2])
 
-            banner_offset = (inner_width / 4.0) + (outer_width / 4.0)
-            thickness = (outer_width - inner_width) / 4.0
-
-            local_corners = [
-                np.array([0, -banner_offset, banner_offset]),
-                np.array([0, banner_offset, banner_offset]),
-                np.array([0, banner_offset, -banner_offset]),
-                np.array([0, -banner_offset, -banner_offset]),
-            ]
-
-            R = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
-            world_corners = [(R @ p) + center for p in local_corners]
-
-            new_obstacles = [
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[0],
-                    "p2": world_corners[1],
-                    "r": thickness,
-                },
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[1],
-                    "p2": world_corners[2],
-                    "r": thickness,
-                },
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[2],
-                    "p2": world_corners[3],
-                    "r": thickness,
-                },
-                {
-                    "type": "cylinder",
-                    "p1": world_corners[3],
-                    "p2": world_corners[0],
-                    "r": thickness,
-                },
-            ]
-
-            for obs_idx, obstacle in zip(self._gate_obstacle_indices[gate_idx], new_obstacles):
+            # Rebuild and write the 4 frame capsules in place (same obstacle indices, so the MPCC
+            # constraint count is unchanged).
+            new_frame = self._frame_capsules(center, yaw, inner_width, outer_width)
+            for obs_idx, obstacle in zip(self._gate_obstacle_indices[gate_idx], new_frame):
                 self.obstacles[obs_idx] = obstacle
+
+            # Move the lower-frame cylinder and the opening corridor to follow the gate.
+            self.obstacles[self._gate_lower_indices[gate_idx]] = self._lower_cylinder(
+                center, outer_width, lower_radius
+            )
+            self._gate_openings[gate_idx] = self._opening_corridor(center, yaw, inner_width)
 
             gate["pos"] = center
             gate["rpy"] = np.array(new_rpy, dtype=np.float64)
@@ -302,11 +299,41 @@ class ObstacleManager:
 
         snap = ObstacleManager(safety_margin=self.safety_margin)
         snap.obstacles = [
-            {"type": o["type"], "p1": o["p1"].copy(), "p2": o["p2"].copy(), "r": float(o["r"])}
+            {
+                "type": o["type"],
+                "p1": o["p1"].copy(),
+                "p2": o["p2"].copy(),
+                "r": float(o["r"]),
+                "kind": o.get("kind"),
+            }
             for i, o in enumerate(self.obstacles)
             if i not in exclude_idx
         ]
+        # Carry the opening corridors so the snapshot biases pruning through gate openings too.
+        snap._gate_openings = [
+            {"center": op["center"].copy(), "axis": op["axis"].copy(), "radius": op["radius"],
+             "half_depth": op["half_depth"]}
+            for op in self._gate_openings
+        ]
+        snap._opening_margin = self._opening_margin
+        snap._opening_half_depth = self._opening_half_depth
         return snap
+
+    def _points_in_openings(self, points: np.ndarray) -> np.ndarray:
+        """Boolean mask of points lying inside ANY gate opening corridor.
+
+        A corridor is the short tube of radius ``radius`` and half-length ``half_depth`` centred
+        on the gate, axed along the gate normal. Points inside it are treated as free space by the
+        planner's pruning even if a frame capsule's margin would clip them — see points_in_obstacles.
+        """
+        n = points.shape[0]
+        inside = np.zeros(n, dtype=bool)
+        for op in self._gate_openings:
+            d = points - op["center"]
+            axial = d @ op["axis"]
+            lateral = np.linalg.norm(d - axial[:, None] * op["axis"], axis=1)
+            inside |= (np.abs(axial) <= op["half_depth"]) & (lateral <= op["radius"])
+        return inside
 
     def points_in_obstacles(self, points: np.ndarray, margin: float | None = None) -> np.ndarray:
         """Return boolean mask of points intersecting obstacles (with margin).
@@ -322,10 +349,14 @@ class ObstacleManager:
         mask = np.zeros(points_arr.shape[0], dtype=bool)
         margin = self.safety_margin if margin is None else float(margin)
 
+        # Opening-corridor bias (improvement 2c): points inside a gate's opening tube are exempt
+        # from that gate's FRAME repulsion, so the planner threads the opening instead of being
+        # pushed around the gate. Poles, spheres and the lower-frame cylinders still always block.
+        in_opening = self._points_in_openings(points_arr) if self._gate_openings else None
+
         # Vectorized over the (many) query points, looping only over the (few) obstacles. This is
         # the hot path of PMM collision pruning — every graph edge calls it on ~20 points against
-        # ~18 capsules, so the previous per-point Python loop dominated planning time. Semantics are
-        # unchanged: a point is flagged if it lies within (radius + margin) of ANY obstacle.
+        # ~20 capsules, so the previous per-point Python loop dominated planning time.
         for obs in self.obstacles:
             if mask.all():
                 break  # every point already flagged; nothing left to test
@@ -342,7 +373,10 @@ class ObstacleManager:
                     t = np.clip((points_arr - p1) @ v / v_norm_sq, 0.0, 1.0)
                     closest = p1 + t[:, None] * v  # (N, 3) nearest point on the segment
                     dist = np.linalg.norm(points_arr - closest, axis=1)
-            mask |= dist <= r_total
+            hit = dist <= r_total
+            if in_opening is not None and obs.get("kind") == "gate_frame":
+                hit &= ~in_opening  # forgive frame contact inside the opening tube
+            mask |= hit
 
         return mask
 

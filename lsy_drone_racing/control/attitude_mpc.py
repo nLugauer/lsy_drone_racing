@@ -398,9 +398,23 @@ class AttitudeMPC(Controller):
                 for pole_pos in np.array(obs["obstacles_pos"], dtype=np.float64).reshape(-1, 3):
                     self._obstacle_manager.add_pole(pole_pos)
 
+        # Gate frame geometry, sourced from the config file rather than hardcoded. Falls back to
+        # the documented nominal dimensions if the [gate_geometry] section is absent. The opening
+        # centre height is taken per-gate from pos[2] (tall vs short gates), so it is not read here.
+        gg = getattr(config, "gate_geometry", None)
+        gate_inner_width = float(getattr(gg, "inner_width", 0.40)) if gg is not None else 0.40
+        gate_outer_width = float(getattr(gg, "outer_width", 0.72)) if gg is not None else 0.72
+        gate_lower_radius = float(getattr(gg, "lower_frame_radius", 0.20)) if gg is not None else 0.20
+
         # Register every gate as an obstacle/waypoint (same for all levels).
         for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
-            self._obstacle_manager.add_gate(gate_pos, gate_rpy)
+            self._obstacle_manager.add_gate(
+                gate_pos,
+                gate_rpy,
+                inner_width=gate_inner_width,
+                outer_width=gate_outer_width,
+                lower_frame_radius=gate_lower_radius,
+            )
 
         # Persist the initial layout so the rest of the controller (PMM build, replanning
         # bookkeeping) works off a single, explicit source of truth.
@@ -447,17 +461,19 @@ class AttitudeMPC(Controller):
             # snapshot, so async replans (_spawn) inherit the same value automatically.
             v_max = 4.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
-            # The initial plan routes through ALL gates, so exclude every gate's own frame from the
-            # PMM's collision pruning (we MUST fly through those openings); poles still block. The
-            # MPCC keeps the full obstacle set for its hard constraints, so clearance is unchanged.
+            # The initial plan routes through ALL gates. Rather than deleting every gate frame from
+            # the PMM's pruning (the old approach, which lost all frame awareness), we keep the
+            # frames and let the opening-corridor carve (ObstacleManager improvement 2c) free a
+            # 0.30 m tube through each opening: the planner is repelled from the frame bars but
+            # guided THROUGH the opening, and the lower-frame cylinders keep it from diving under a
+            # gate. The MPCC keeps the full obstacle set for its hard constraints, so clearance is
+            # unchanged. (snapshot() still gives the worker a frozen, thread-safe obstacle copy.)
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
                 gate_rpys=gate_rpys,
                 start_vel=np.array(obs["vel"], dtype=np.float64),
-                obstacle_manager=self._obstacle_manager.snapshot(
-                    exclude_gate_centers=gate_positions
-                ),
+                obstacle_manager=self._obstacle_manager.snapshot(),
                 u_max=21.0,
                 v_max=v_max,
                 n_vel_samples=100,  # offline initial plan: more samples -> better global line
