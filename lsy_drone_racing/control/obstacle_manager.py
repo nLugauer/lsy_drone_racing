@@ -34,6 +34,15 @@ class ObstacleManager:
         self._q_wp = 300.0
         self._sigma_sq = 0.35**2
 
+        # Adaptive contour weight: scale the per-gate q_c bump by how far a gate's revealed
+        # position has moved from the nominal one the trajectory was planned through. Small
+        # move -> full bump (fly the nominal center); large move -> reduced bump (loosen the
+        # tracking so the controller can leave the now-wrong nominal line and thread the true
+        # opening, which the gate-frame collision constraints already enforce at the real pos).
+        self._qc_err_full = 0.05  # [m] error at/below which the full bump is kept (scale = 1)
+        self._qc_err_zero = 0.20  # [m] error at/above which the bump is at its floor
+        self._qc_scale_min = 0.15  # floor (not 0) so a gentle pull toward center always remains
+
     def add_sphere(self, center: np.ndarray, radius: float) -> None:
         """Add a spherical obstacle.
 
@@ -125,6 +134,10 @@ class ObstacleManager:
         self.gates.append(
             {
                 "pos": center,
+                # Position the reference trajectory was planned through. Frozen here at
+                # construction (nominal) and never overwritten by update_gate_positions, so
+                # dynamic_contour_weight can measure how far a revealed gate has moved.
+                "nominal_pos": center.copy(),
                 "rpy": np.array(rpy, dtype=np.float64),
                 "inner_width": inner_width,
                 "outer_width": outer_width,
@@ -364,13 +377,39 @@ class ObstacleManager:
 
         return float(min_dist if min_dist != float("inf") else 0.0)
 
+    def _gate_contour_scale(self, gate: dict) -> float:
+        """Scale a gate's contour-weight bump by how far it moved from its nominal position.
+
+        The reference trajectory is fixed and was planned through ``gate["nominal_pos"]``. When
+        the gate's revealed position (``gate["pos"]``) is close to that, the nominal centerline
+        is trustworthy, so the full bump is applied and the drone hugs the center. When the gate
+        has moved a lot, the nominal line points at the wrong place; the bump is reduced toward
+        ``_qc_scale_min`` so the controller is free to deviate from that line and let the
+        gate-frame collision constraints (which track the true position) thread the real opening.
+
+        Returns a factor in ``[_qc_scale_min, 1.0]``, linear in the position error between
+        ``_qc_err_full`` and ``_qc_err_zero``.
+        """
+        nominal = gate.get("nominal_pos")
+        if nominal is None:
+            return 1.0
+        err = float(np.linalg.norm(gate["pos"] - nominal))
+        if err <= self._qc_err_full:
+            return 1.0
+        if err >= self._qc_err_zero:
+            return self._qc_scale_min
+        frac = (err - self._qc_err_full) / (self._qc_err_zero - self._qc_err_full)
+        return 1.0 + frac * (self._qc_scale_min - 1.0)
+
     def dynamic_contour_weight(
         self, position: np.ndarray, target_gate_idx: int | None = None
     ) -> float:
         """Compute dynamic contour weight based on gate proximity.
 
         Near gates, increases the weighting of contour error in the MPCC cost.
-        This provides soft obstacle avoidance without hard constraints.
+        This provides soft obstacle avoidance without hard constraints. The per-gate bump is
+        additionally scaled by ``_gate_contour_scale`` so a gate whose revealed position has
+        drifted far from nominal loosens (rather than tightens) tracking of the stale centerline.
 
         Args:
             position: Current drone position [x, y, z].
@@ -386,12 +425,14 @@ class ObstacleManager:
             # Only calculate weighting for the next gate the drone actually has to pass
             gate = self.gates[target_gate_idx]
             dist_sq = np.sum((position - gate["pos"]) ** 2)
-            q_c += self._q_wp * np.exp(-0.5 * dist_sq / self._sigma_sq)
+            q_c += self._gate_contour_scale(gate) * self._q_wp * np.exp(-0.5 * dist_sq / self._sigma_sq)
         else:
             # Fallback: behavior for all gates if no target is specified
             for gate in self.gates:
                 dist_sq = np.sum((position - gate["pos"]) ** 2)
-                q_c += self._q_wp * np.exp(-0.5 * dist_sq / self._sigma_sq)
+                q_c += self._gate_contour_scale(gate) * self._q_wp * np.exp(
+                    -0.5 * dist_sq / self._sigma_sq
+                )
 
         return float(q_c)
 
