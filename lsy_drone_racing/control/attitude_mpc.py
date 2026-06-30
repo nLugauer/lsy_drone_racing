@@ -153,8 +153,19 @@ def create_acados_model(
     model.cost_y_expr_e = ca.vertcat(weighted_e_cont, e_lag_scalar)
 
     if num_obs > 0:
-        model.con_h_expr = obs_manager.get_collision_expressions(x_aug, p_obs)
-        model.con_h_expr_e = obs_manager.get_collision_expressions(x_aug, p_obs)
+        # Two slacked constraints per obstacle, both built from the same signed distance h:
+        #   * hard  : h = dist - r_total            >= 0   (safety floor at the obstacle surface)
+        #   * buffer: h - delta = dist - (r_total+delta) >= 0  (a band of width delta in front of it)
+        # The buffer is slacked with a QUADRATIC-only penalty (see create_ocp_solver), giving a
+        # smooth, continuously differentiable repulsive cost that ramps up as the drone enters the
+        # band and is exactly zero outside it. This steers the trajectory away gradually instead of
+        # the hard constraint snapping active at contact, which is what made the MPC jump near
+        # obstacles. The hard constraint stays as the last-resort safety net.
+        buffer_dist = parameters.get("obstacle_buffer", 0.15)
+        h = obs_manager.get_collision_expressions(x_aug, p_obs)
+        con = ca.vertcat(h, h - buffer_dist)
+        model.con_h_expr = con
+        model.con_h_expr_e = con
 
     return model
 
@@ -235,8 +246,10 @@ def create_ocp_solver(
     # We have to set x0 even though we will overwrite it later on.
     ocp.constraints.x0 = np.zeros((nx))
 
-    nh = len(obs_manager.obstacles)
-    if nh > 0:
+    n_obs = len(obs_manager.obstacles)
+    # con_h_expr stacks [hard (n_obs) ; buffer (n_obs)] -> 2*n_obs slacked constraints.
+    nh = 2 * n_obs
+    if n_obs > 0:
         # We want h(x) >= 0, so lower bound is 0, upper bound is infinity
         ocp.constraints.lh = np.zeros(nh)
         ocp.constraints.uh = 1e9 * np.ones(nh)
@@ -247,12 +260,19 @@ def create_ocp_solver(
         ocp.constraints.idxsh = np.arange(nh)
         ocp.constraints.idxsh_e = np.arange(nh)
 
-        # Linear-Quadratic Penalty Weights
-        Z_l_weight = parameters.get("Z_l", 4000.0)
-        z_l_weight = parameters.get("z_l", 4000.0)
+        # Penalty weights, split by constraint half:
+        #   * hard half (the safety floor at the surface): keep the linear+quadratic exact-penalty
+        #     weights so intrusion is strongly resisted.
+        #   * buffer half (the band in front of the obstacle): QUADRATIC ONLY (zl = 0). A quadratic
+        #     slack penalty is C1 in the slack, so the repulsion ramps up smoothly from the band
+        #     edge with no gradient kink — this is the smooth approach band. A moderate weight keeps
+        #     it from dominating the tracking cost away from obstacles.
+        Z_hard = parameters.get("Z_l", 4000.0)
+        z_hard = parameters.get("z_l", 4000.0)
+        Z_buffer = parameters.get("Z_buffer", 2000.0)
 
-        Z_l = Z_l_weight * np.ones(nh)
-        z_l = z_l_weight * np.ones(nh)
+        Z_l = np.concatenate([Z_hard * np.ones(n_obs), Z_buffer * np.ones(n_obs)])
+        z_l = np.concatenate([z_hard * np.ones(n_obs), np.zeros(n_obs)])
 
         ocp.cost.Zl = Z_l
         ocp.cost.Zu = np.zeros(nh)
@@ -283,7 +303,7 @@ def create_ocp_solver(
     ocp.solver_options.qp_solver_iter_max = 20
     ocp.solver_options.nlp_solver_max_iter = 50
 
-    num_params = 14 + (6 * nh)
+    num_params = 14 + (6 * n_obs)  # 6 coords per obstacle; both constraint halves share them
     ocp.parameter_values = np.zeros((num_params,))
 
     # set prediction horizon
