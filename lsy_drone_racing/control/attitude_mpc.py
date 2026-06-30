@@ -271,6 +271,12 @@ def create_ocp_solver(
     ocp.solver_options.nlp_solver_type = "SQP_RTI"  # switch to RTI
     ocp.solver_options.tol = 1e-6
 
+    # Levenberg-Marquardt regularization of the Gauss-Newton Hessian (adds lambda*I). Damps the
+    # single undamped RTI step so the trajectory does not swing tick-to-tick near obstacles, and
+    # stabilizes the weakly-weighted directions (v_theta, a_theta) whose GN Hessian is near-singular.
+    # 1e-3 is a gentle default; raise toward 1e-2..1e-1 if large jumps near obstacles persist.
+    ocp.solver_options.levenberg_marquardt = 1e-3
+
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
 

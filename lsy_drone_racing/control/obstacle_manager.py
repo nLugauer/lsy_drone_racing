@@ -485,8 +485,15 @@ class ObstacleManager:
     def get_collision_expressions(self, x_sym: ca.MX, p_sym: ca.MX) -> ca.MX:
         """Generate CasADi collision constraint expressions.
 
-        Expressions: distance² - (radius + margin)² ≥ 0 (drone outside obstacle).
-        Used for optional collision constraints in future implementations.
+        Expression per obstacle: signed distance ``dist - (radius + margin) >= 0`` (drone outside).
+
+        Signed distance (not the old squared form ``dist^2 - r^2``) is used deliberately for solver
+        conditioning: its gradient w.r.t. position is the unit surface normal everywhere (magnitude
+        1, independent of how far the node is), and the slack the SQP measures is the penetration in
+        METRES, so a given physical intrusion always costs the same regardless of obstacle size. The
+        squared form instead had a distance-scaled gradient and a tiny, size-dependent slack for thin
+        poles, which under-penalised intrusions and made the QP swing near obstacles. ``dist`` is
+        ``sqrt(dist_sq + eps)``; the eps only smooths the (never-reached) on-axis singularity.
 
         Args:
             x_sym: State vector (x[0:3] is drone position).
@@ -497,6 +504,7 @@ class ObstacleManager:
         """
         constraints = []
         drone_pos = x_sym[0:3]
+        eps = 1e-6  # smooths sqrt at dist=0 (the drone never reaches an obstacle axis)
 
         for i, obs in enumerate(self.obstacles):
             idx = i * 6
@@ -507,7 +515,6 @@ class ObstacleManager:
 
             if obs["type"] == "sphere":
                 dist_sq = ca.sumsqr(drone_pos - p1)
-                constraints.append(dist_sq - r_total**2)
             else:
                 v = p2 - p1
                 w = drone_pos - p1
@@ -517,7 +524,8 @@ class ObstacleManager:
 
                 closest_point = p1 + t_clamped * v
                 dist_sq = ca.sumsqr(drone_pos - closest_point)
-                constraints.append(dist_sq - r_total**2)
+
+            constraints.append(ca.sqrt(dist_sq + eps) - r_total)
 
         return ca.vcat(constraints)
 
