@@ -317,7 +317,7 @@ class AttitudeMPC(Controller):
     # still updated every tick, so the MPCC's hard collision constraints always use LIVE positions
     # even with replanning off -- only the reference centerline is frozen. Set False on this
     # experimental branch to A/B plan-once vs replanning.
-    PMM_REPLAN = False
+    PMM_REPLAN = True
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
@@ -870,9 +870,15 @@ class AttitudeMPC(Controller):
             tang_n = tang / (np.linalg.norm(tang) + 1e-9)
             reversing = speed > 0.3 and float(np.dot(tang_n, vel / speed)) < 0.0
             if not reversing:
+                old_theta = self._current_theta
                 self._trajectory = new_planner
                 self._reanchor_progress(obs)
-                self._needs_warm_start_reset = True  # previous warm start was for the old path
+                # Preserve the warm start across the swap (Decision: smooth stitch). Both paths are
+                # arc-length and share the near-field geometry, so they differ only by a constant
+                # progress offset; shift the stored solution's theta by that offset instead of
+                # discarding it. A kinematic reset would make the single RTI step jump. v_theta and
+                # positions are parameterization-independent and remain valid.
+                self._shift_warmstart_theta(self._current_theta - old_theta)
                 logger.info(
                     "REPLAN adopted: target_gate=%d, path_len=%.2f m",
                     target,
@@ -941,7 +947,12 @@ class AttitudeMPC(Controller):
         committed_pts = None
         committed_speeds = None
         if theta_commit - theta_now > 0.05:
-            s_pre = np.linspace(theta_now, theta_commit, 12)
+            # Sample the current path over the committed near-field densely (curvature/position
+            # fidelity) and prepend it, so the new reference reproduces the old one in position and
+            # tangent from the drone up to the commit point -> a continuous (C1) reference across the
+            # swap. The new plan starts FORWARD at the commit point (start_pos below).
+            n_pre = max(12, int((theta_commit - theta_now) / 0.025) + 1)
+            s_pre = np.linspace(theta_now, theta_commit, n_pre)
             committed_pts = np.asarray(self._trajectory.evaluate(s_pre), dtype=np.float64)
             committed_speeds = np.array(
                 [float(self._trajectory.evaluate_speed(float(s))) for s in s_pre], dtype=np.float64
@@ -1022,6 +1033,22 @@ class AttitudeMPC(Controller):
         t_norm = t_new / (np.linalg.norm(t_new) + 1e-6)
         v_proj = float(np.dot(np.array(obs["vel"], dtype=np.float64), t_norm))
         self._current_v_theta = max(0.01, v_proj)
+
+    def _shift_warmstart_theta(self, delta: float) -> None:
+        """Add a constant progress offset to every warm-start stage's theta after a replan swap.
+
+        Keeps the previous solution as the warm start while the trajectory's arc-length origin
+        changes: the near-field geometry is identical across the swap, so the predicted stage states
+        stay valid once their (re-parameterized) theta is shifted by the same constant the drone's
+        own theta shifted by. Only theta (state index 13) changes; v_theta and the physical states
+        are unaffected. No-op on the first tick (no stored solution yet).
+        """
+        if self._tick == 0:
+            return
+        for j in range(self._N + 1):
+            xj = self._acados_ocp_solver.get(j, "x")
+            xj[13] += delta
+            self._acados_ocp_solver.set(j, "x", xj)
 
     def _legacy_rebuild(
         self, obs: dict[str, NDArray[np.floating]], gates_pos: NDArray[np.floating]
