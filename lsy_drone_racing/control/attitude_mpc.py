@@ -242,7 +242,7 @@ class AttitudeMPC(Controller):
         self._log_contour, self._log_lag = [], []
         self._log_v_theta, self._log_a_theta, self._log_q_c = [], [], []
 
-        self._obstacle_manager = ObstacleManager(safety_margin=0.11)
+        self._obstacle_manager = ObstacleManager(safety_margin=0.12)
 
         # Track layout. Levels 0-2 (randomize False) read nominal gate/obstacle positions from the
         # config. Level 3 (randomize True) has only origin placeholders there; the real randomized
@@ -311,9 +311,9 @@ class AttitudeMPC(Controller):
                 gate_rpys=gate_rpys,
                 start_vel=np.array(obs["vel"], dtype=np.float64),
                 obstacle_manager=self._obstacle_manager.snapshot(),
-                u_max=21.0,
+                u_max=12.0,
                 v_max=v_max,
-                n_vel_samples=100,  # offline initial plan: more samples -> better global line
+                n_vel_samples=600,  # offline initial plan: more samples -> better global line
                 tail_extension=tail_extension,
             )
         else:
@@ -370,9 +370,11 @@ class AttitudeMPC(Controller):
         self._planned_gates_pos = gate_positions.copy()
         self._planned_target = 0
         self._replan_horizon = 3  # gates ahead of the target to replan through (paper Sec. VI-B)
-        self._replan_vel_samples = 150
-        self._replan_gate_move = 0.06  # [m] observed gate shift that triggers a replan
-        self._commit_distance = 0.4  # [m] near-field kept fixed across a replan (no reference jump)
+        self._replan_vel_samples = 80
+        self._replan_gate_move = 0.12  # [m] observed gate shift that triggers a replan
+        self._commit_distance = (
+            0.35  # [m] near-field kept fixed across a replan (no reference jump)
+        )
         self._gate_approach_margin = 0.4  # [m] approach room left before the target gate on replan
 
     def _stage_params(

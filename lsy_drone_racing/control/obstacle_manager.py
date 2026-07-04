@@ -33,8 +33,9 @@ class ObstacleManager:
         self._gate_openings = []  # per-gate opening corridor: {center, axis, radius, half_depth}
         self._pole_obstacle_indices = []
         self._q_nom = 1.0
-        self._q_wp = 300.0
+        self._q_wp = 10
         self._sigma_sq = 0.35**2
+        self._enable_qc_scaling = False
 
         # Gate opening corridor (PMM pruning only, NOT the MPCC constraints): a short tube through
         # each opening that points_in_obstacles treats as free space, biasing the planner to thread
@@ -294,6 +295,8 @@ class ObstacleManager:
         ``_qc_err_full`` and ``_qc_err_zero``. Close to nominal -> full bump (hug the center);
         far from nominal -> reduced bump (let the collision constraints thread the true opening).
         """
+        if self._enable_qc_scaling is False:
+            return 1.0
         nominal = gate.get("nominal_pos")
         if nominal is None:
             return 1.0
