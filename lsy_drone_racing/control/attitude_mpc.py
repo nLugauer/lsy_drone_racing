@@ -6,6 +6,8 @@ contour/lag errors, control effort and progress are penalised. The reference is 
 PMM racing line (point_mass_planner.py); gates/poles enter the cost as a dynamic contour weight and
 the solver as soft collision constraints (obstacle_manager.py). Built and solved with acados
 (SQP-RTI) at 50 Hz.
+
+based on OG attitude_mpc.py structure by LSY
 """
 
 from __future__ import annotations
@@ -214,12 +216,9 @@ def create_ocp_solver(
 class AttitudeMPC(Controller):
     """MPCC controller using the collective-thrust and attitude interface."""
 
-    # Reference source: True -> PMM sampling planner; False -> chord-length cubic spline
-    # (trajectory_planner.py). Same public API either way. Kept as an A/B toggle.
     USE_PMM_PLANNER = True
 
-    # Online replanning: True -> replan the reference as gates are revealed (off-thread); False ->
-    # plan once before takeoff and only track. Collision constraints use live positions regardless.
+    # Online replanning: True -> replan the reference as gates are revealed; False -> OG track
     PMM_REPLAN = True
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
@@ -244,48 +243,19 @@ class AttitudeMPC(Controller):
 
         self._obstacle_manager = ObstacleManager(safety_margin=0.12)
 
-        # Track layout. Levels 0-2 (randomize False) read nominal gate/obstacle positions from the
-        # config. Level 3 (randomize True) has only origin placeholders there; the real randomized
-        # layout (in visit order) arrives through the reset obs/info.
-        if not bool(getattr(config.env.track, "randomize", False)):
-            gate_positions = np.array([g["pos"] for g in config.env.track.gates], dtype=np.float64)
-            gate_rpys = np.array([g["rpy"] for g in config.env.track.gates], dtype=np.float64)
-            if getattr(config.env.track, "obstacles", None):
-                for pole_pos in config.env.track.obstacles:
-                    self._obstacle_manager.add_pole(pole_pos)
-        else:
-            if "gates_pos" in info:
-                gate_positions = np.array(info["gates_pos"], dtype=np.float64).reshape(-1, 3)
-            elif "gates_pos" in obs:
-                gate_positions = np.array(obs["gates_pos"], dtype=np.float64).reshape(-1, 3)
-            else:
-                gate_positions = np.array(
-                    [g["pos"] for g in config.env.track.gates], dtype=np.float64
-                )
-            if "gates_quat" in info:
-                gate_quats = np.array(info["gates_quat"], dtype=np.float64).reshape(-1, 4)
-            elif "gates_quat" in obs:
-                gate_quats = np.array(obs["gates_quat"], dtype=np.float64).reshape(-1, 4)
-            else:
-                gate_quats = np.array(
-                    [R.from_euler("xyz", g["rpy"]).as_quat() for g in config.env.track.gates],
-                    dtype=np.float64,
-                )
-            gate_rpys = R.from_quat(gate_quats).as_euler("xyz")
-            if "obstacles_pos" in info:
-                poles = np.array(info["obstacles_pos"], dtype=np.float64).reshape(-1, 3)
-            elif "obstacles_pos" in obs:
-                poles = np.array(obs["obstacles_pos"], dtype=np.float64).reshape(-1, 3)
-            else:
-                poles = np.empty((0, 3))
-            for pole_pos in poles:
-                self._obstacle_manager.add_pole(pole_pos)
+        gate_positions = np.array(obs["gates_pos"], dtype=np.float64).reshape(-1, 3)
+        gate_quats = np.array(obs["gates_quat"], dtype=np.float64).reshape(-1, 4)
+        gate_rpys = R.from_quat(gate_quats).as_euler("xyz")
+        poles = np.array(obs.get("obstacles_pos", np.empty((0, 3))), dtype=np.float64).reshape(
+            -1, 3
+        )
+        for pole_pos in poles:
+            self._obstacle_manager.add_pole(pole_pos)
 
-        # Gate frame geometry from the config, falling back to the nominal dimensions.
-        gg = getattr(config, "gate_geometry", None)
-        inner_w = float(getattr(gg, "inner_width", 0.40)) if gg is not None else 0.40
-        outer_w = float(getattr(gg, "outer_width", 0.72)) if gg is not None else 0.72
-        lower_r = float(getattr(gg, "lower_frame_radius", 0.20)) if gg is not None else 0.20
+        # Setting up gate geometry and adding to obstacle manager
+        inner_w = 0.40
+        outer_w = 0.72
+        lower_r = 0.12
         for gate_pos, gate_rpy in zip(gate_positions, gate_rpys):
             self._obstacle_manager.add_gate(
                 gate_pos,
@@ -359,12 +329,10 @@ class AttitudeMPC(Controller):
         self._last_u0 = np.array([0.0, 0.0, 0.0, self._last_thrust])  # QP-failure fallback
         self._needs_warm_start_reset = False
 
-        # Asynchronous PMM replanning (PMM planner only). As gate positions are revealed within
-        # sensor range we replan OFF the control thread so the 50 Hz loop never stalls; the obstacle
+        # Asynchronous PMM replanning so the 50 Hz loop never stalls; the obstacle
         # manager is updated every tick, so the MPCC constraints always use live positions.
         self._replanner = AsyncPMMReplanner() if self.USE_PMM_PLANNER else None
-        # Offline backbone: the high-M global plan above. Online replans patch only the local window
-        # and splice this backbone's far field back in as a committed suffix.
+        # Offline backbone: the high-M global plan above
         self._backbone = self._trajectory if self.USE_PMM_PLANNER else None
         self._suffix_gap = 0.5  # [m] start the backbone suffix this far past the last window gate
         self._planned_gates_pos = gate_positions.copy()
@@ -396,41 +364,24 @@ class AttitudeMPC(Controller):
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
         """Compute the next collective-thrust + roll/pitch/yaw command for one control tick."""
-        if info is not None:
-            gates_pos = gates_yaw = gates_rpys = None
-            if "gates_pos" in info:
-                gates_pos = np.array(info["gates_pos"], dtype=np.float64)
-            elif "gates_pos" in obs:
-                gates_pos = np.array(obs["gates_pos"], dtype=np.float64)
-            if "gates_yaw" in info:
-                gates_yaw = np.array(info["gates_yaw"], dtype=np.float64)
-            elif "gates_quat" in obs:
-                gates_yaw = R.from_quat(np.array(obs["gates_quat"], dtype=np.float64)).as_euler(
-                    "xyz"
-                )[:, 2]
-            if gates_pos is not None and gates_yaw is not None:
-                gates_rpys = np.zeros((gates_pos.shape[0], 3), dtype=np.float64)
-                gates_rpys[:, 2] = gates_yaw
-                self._obstacle_manager.update_gate_positions(gates_pos, gates_rpys)
+        gates_pos = np.array(obs["gates_pos"], dtype=np.float64)
+        gate_quats = np.array(obs["gates_quat"], dtype=np.float64)
+        gates_yaw = R.from_quat(gate_quats).as_euler("xyz")[:, 2]
+        gates_rpys = np.zeros((gates_pos.shape[0], 3), dtype=np.float64)
+        gates_rpys[:, 2] = gates_yaw
+        self._obstacle_manager.update_gate_positions(gates_pos, gates_rpys)
 
-            obstacles_pos = None
-            if "obstacles_pos" in info:
-                obstacles_pos = np.array(info["obstacles_pos"], dtype=np.float64)
-            elif "obstacles_pos" in obs:
-                obstacles_pos = np.array(obs["obstacles_pos"], dtype=np.float64)
-            if obstacles_pos is not None:
-                self._obstacle_manager.update_pole_positions(obstacles_pos)
+        obstacles_pos = np.array(obs.get("obstacles_pos", np.empty((0, 3))), dtype=np.float64)
+        self._obstacle_manager.update_pole_positions(obstacles_pos)
 
-            # Replan when a gate's observed position changes (its true position was revealed within
-            # the 0.7 m sensor range) or the target advances. PMM replans off-thread; the legacy
-            # spline rebuilds synchronously. Gated by PMM_REPLAN.
-            if gates_pos is not None and self.PMM_REPLAN:
-                if self.USE_PMM_PLANNER:
-                    self._maybe_replan_pmm(
-                        obs, gates_pos, gates_rpys if gates_yaw is not None else None
-                    )
-                elif "gates_visited" in obs:
-                    self._legacy_rebuild(obs, gates_pos)
+        # Replan when a gate's observed position changes
+        if gates_pos is not None and self.PMM_REPLAN:
+            if self.USE_PMM_PLANNER:
+                self._maybe_replan_pmm(
+                    obs, gates_pos, gates_rpys if gates_yaw is not None else None
+                )
+            elif "gates_visited" in obs:
+                self._original_rebuild(obs, gates_pos)
 
         # The environment sets target_gate to -1 once the final gate plane is crossed.
         target_gate_idx = int(obs.get("target_gate", 0))
@@ -477,7 +428,7 @@ class AttitudeMPC(Controller):
                 j, "p", self._stage_params(theta_pred, target_gate_idx, obs_params, total_params)
             )
 
-            # Steer v_theta toward the PMM's time-optimal speed here (fast on straights, slower into
+            # Steer v_theta toward the PMM's time-optimal speed (fast on straights, slower into
             # turns), clipped to the v_theta bound. Legacy spline keeps the constant target.
             if self.USE_PMM_PLANNER:
                 yref_j = yref_target.copy()
@@ -535,24 +486,16 @@ class AttitudeMPC(Controller):
     ) -> None:
         """Off-thread PMM replanning: adopt a finished background plan and/or start a new one.
 
-        Each tick this swaps in a finished (non-stale, non-reversing) plan and, if a gate in the
-        replan window moved or the target advanced, requests a fresh plan on a worker thread. The
+        Each tick this swaps in a finished plan and, if a gate in the
+        replan window moved, requests a fresh plan on a worker thread. The
         control loop keeps flying the current plan meanwhile.
-
-        Args:
-            obs: Current observation (uses pos, vel, target_gate).
-            gates_pos: (N, 3) observed gate positions (nominal until revealed).
-            gates_rpys: (N, 3) observed gate orientations, or None to derive normals from geometry.
         """
         target = int(obs.get("target_gate", 0))
 
-        # (1) Adopt a finished plan only if its starting gate has not been passed since the request
-        # (a stale plan would route the reference backward through an already-passed gate).
+        # Adopt a finished plan only if its starting gate has not been passed since the request
         new_planner = self._replanner.take()
         if new_planner is not None and target == self._planned_target:
-            # Reject a reversing plan: if the new path's initial tangent opposes the drone's
-            # velocity, adopting it would yank the reference backward. Evaluated at the start knot
-            # (where the committed near-field begins), not the global-nearest point.
+            # Reject a reversing plan
             vel = np.array(obs["vel"], dtype=np.float64)
             speed = float(np.linalg.norm(vel))
             tang = np.asarray(
@@ -564,8 +507,7 @@ class AttitudeMPC(Controller):
                 old_theta = self._current_theta
                 self._trajectory = new_planner
                 self._reanchor_progress(obs)
-                # Both paths are arc-length and share the near-field, so keep the warm start and
-                # shift its theta by the same constant the drone's own theta shifted by.
+                # Keep the warm start and shift its theta
                 self._shift_warmstart_theta(self._current_theta - old_theta)
                 logger.info(
                     "REPLAN adopted: target=%d, len=%.2f m", target, self._trajectory.total_length
@@ -580,19 +522,19 @@ class AttitudeMPC(Controller):
         if target < 0:
             return  # final gate passed; nothing left to plan
 
-        # (2) Trigger: a gate in the planning window moved beyond threshold, or the target advanced.
+        # Trigger: a gate in the planning window moved beyond threshold.
         window = slice(target, min(target + self._replan_horizon, len(gates_pos)))
         moved = 0.0
         if window.stop > window.start:
             moved = float(
                 np.max(np.linalg.norm(gates_pos[window] - self._planned_gates_pos[window], axis=1))
             )
-        if not (target != self._planned_target or moved > self._replan_gate_move):
+        if moved <= self._replan_gate_move:
             return
         if self._replanner.busy():
             return  # a replan is already running; re-checked next tick
 
-        reason = "target_advance" if target != self._planned_target else f"gate_moved={moved:.3f}m"
+        reason = f"gate_moved={moved:.3f}m"
         logger.info(
             "REPLAN trigger @%d: %s, target=%d, window=[%d:%d]",
             self._tick,
@@ -602,9 +544,9 @@ class AttitudeMPC(Controller):
             window.stop,
         )
 
-        # Commit the near-field: start the new plan a short look-ahead (commit_distance) ahead of
+        # Start new plan a short look-ahead (commit_distance) ahead of
         # the drone and prepend the segment in between, so the immediate reference is unchanged
-        # across adoption. Stop committing before the target gate to leave approach room.
+        # across adoption
         knots = self._trajectory.knot_points
         theta_now = float(np.clip(self._current_theta, knots[0], knots[-1]))
         theta_commit = min(theta_now + self._commit_distance, self._trajectory.total_length)
@@ -631,9 +573,7 @@ class AttitudeMPC(Controller):
             start_pos = np.array(obs["pos"], dtype=np.float64)
             start_vel = np.array(obs["vel"], dtype=np.float64)
 
-        # Far-field suffix: reuse the offline backbone beyond the replan window so the global racing
-        # line is preserved instead of re-solved at low M. Read here (never mutated) so the worker
-        # only sees frozen arrays.
+        # Far-field suffix: reuse the offline backbone beyond the replan window (if number of gates is smaller than total number of gates)
         committed_suffix_pts = committed_suffix_speeds = None
         if self._backbone is not None and window.stop < len(gates_pos):
             bb = self._backbone
@@ -647,7 +587,7 @@ class AttitudeMPC(Controller):
                 committed_suffix_pts = np.asarray(bb.evaluate(s_suf), dtype=np.float64)
                 committed_suffix_speeds = np.asarray(bb.evaluate_speed(s_suf), dtype=np.float64)
 
-        # Snapshots on this (control) thread so the worker reads no shared mutable state. Exclude
+        # Snapshots on this thread so the worker reads no shared mutable state. Exclude
         # only the gates this replan routes through, so it can fly through their openings.
         horizon_gates = np.array(gates_pos[window], dtype=np.float64)
         horizon_rpys = (
@@ -694,7 +634,7 @@ class AttitudeMPC(Controller):
     def _shift_warmstart_theta(self, delta: float) -> None:
         """Add a constant progress offset to every warm-start stage's theta after a replan swap.
 
-        The near-field geometry is identical across the swap, so shifting only theta (state 13) by
+        The near-field geometry is identical across the swap, so shifting only theta by
         the same constant keeps the stored solution valid. No-op on the first tick.
         """
         if self._tick == 0:
@@ -704,7 +644,7 @@ class AttitudeMPC(Controller):
             xj[13] += delta
             self._acados_ocp_solver.set(j, "x", xj)
 
-    def _legacy_rebuild(
+    def _original_rebuild(
         self, obs: dict[str, NDArray[np.floating]], gates_pos: NDArray[np.floating]
     ) -> None:
         """Synchronous rebuild for the non-PMM spline planner (USE_PMM_PLANNER False).

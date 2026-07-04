@@ -1,14 +1,7 @@
-"""Point Mass Model (PMM) trajectory planner.
+"""Point-mass trajectory planner for the PMM stack.
 
-Sampling-based, near time-optimal planner from Foehn et al., "AlphaPilot: Autonomous Drone Racing"
-(Autonomous Robots, 2021), Sec. VI. The drone is a point mass with bounded per-axis acceleration;
-minimum-time primitives are closed-form bang-bang (eq. 23) / bang-singular-bang (eq. 24). A layered
-graph over sampled gate-crossing velocities (Sec. VI-B) is solved with Dijkstra and refit as a cubic
-spline in true arc length (Sec. VI-C).
-
-Only the arc-length geometry (plus a speed profile used as a soft v_theta reference) is exposed; the
-MPCC picks speed itself. The interface matches ``TrajectoryPlanner``, so ``attitude_mpc.py`` is
-consumed unchanged.
+It builds minimum-time motion primitives, solves a sampled gate-crossing graph, and fits the
+result as an arc-length cubic spline for the MPCC controller.
 """
 
 from __future__ import annotations
@@ -37,7 +30,7 @@ logger = logging.getLogger("lsy_drone_racing.pmm")
 def _jax_edge_cost_base(
     p0: jax.Array, v0: jax.Array, pf: jax.Array, vf: jax.Array, u_max: jax.Array, v_cap: jax.Array
 ) -> jax.Array:
-    """Minimum time T* of a single edge (max over the 3 axes); jnp.inf if infeasible."""
+    """Compute the minimum-time edge cost for a single primitive."""
     dp = pf - p0
 
     def _solve_axis(
@@ -101,7 +94,6 @@ def _jax_edge_cost_base(
     return jnp.max(jax.vmap(_solve_axis)(dp, v0, vf, u_max, v_cap))
 
 
-# Fully batched, JIT-compiled edge cost: outer vmap over layer A, inner vmap over layer B.
 _jax_edge_cost = jax.jit(
     jax.vmap(
         jax.vmap(_jax_edge_cost_base, in_axes=(None, None, 0, 0, None, None)),
@@ -110,11 +102,8 @@ _jax_edge_cost = jax.jit(
 )
 
 
-# ----------------------------------------------------------------------------------------
-# 1-D minimum-time double-integrator primitives (Sec. VI-A)
-# ----------------------------------------------------------------------------------------
 class _Axis1D:
-    """A single-axis acceleration profile as a list of (accel, duration) phases."""
+    """Return a one-dimensional acceleration profile."""
 
     def __init__(self, p0: float, v0: float, phases: list[tuple[float, float]]) -> None:
         self.p0 = float(p0)
@@ -137,11 +126,7 @@ class _Axis1D:
 
 
 class _CubicAxis1D:
-    """Single-axis cubic Hermite profile reaching (pf, vf) at exactly time T.
-
-    Synchronization fallback for a non-critical axis that bang-bang cannot stretch to T*. The PMM
-    timing is discarded downstream, so only the smooth geometric shape matters.
-    """
+    """Return a one-dimensional cubic profile used as a fallback for slack axes."""
 
     def __init__(self, p0: float, v0: float, pf: float, vf: float, T: float) -> None:
         self.p0, self.v0, self.T = float(p0), float(v0), float(T)
@@ -159,7 +144,7 @@ class _CubicAxis1D:
 
 
 def _quad_roots(a: float, b: float, c: float) -> list[float]:
-    """Real roots of a x^2 + b x + c = 0 (handles the linear/degenerate cases)."""
+    """Return the real roots of a quadratic polynomial."""
     if abs(a) < 1e-12:
         return [] if abs(b) < 1e-12 else [-c / b]
     disc = b * b - 4.0 * a * c
@@ -172,7 +157,7 @@ def _quad_roots(a: float, b: float, c: float) -> list[float]:
 def _two_phase_time(
     p0: float, v0: float, pf: float, vf: float, a1: float, a2: float
 ) -> tuple[float, float, float] | None:
-    """Two-phase (accel a1 then a2) maneuver via dp = A t1^2 + B t1 + C. Returns (T, t1, t2)."""
+    """Return the two-phase profile for one axis."""
     dp = pf - p0
     A = a1 * (a2 - a1) / (2.0 * a2)
     B = v0 * (a2 - a1) / a2
@@ -196,11 +181,7 @@ def _two_phase_time(
 def min_time_1d(
     p0: float, v0: float, pf: float, vf: float, u_lo: float, u_hi: float, v_cap: float | None = None
 ) -> _Axis1D:
-    """Minimum-time profile for a 1-D double integrator with accel in [u_lo, u_hi].
-
-    Bang-bang (eq. 23); if ``v_cap`` is given and the peak speed would exceed it, a cruise phase
-    yields a bang-singular-bang solution (eq. 24).
-    """
+    """Return the minimum-time profile for one axis."""
     best, best_a = None, None
     for a1, a2 in ((u_hi, u_lo), (u_lo, u_hi)):
         sol = _two_phase_time(p0, v0, pf, vf, a1, a2)
@@ -222,7 +203,7 @@ def min_time_1d(
 def min_time_1d_capped(
     p0: float, v0: float, pf: float, vf: float, u_lo: float, u_hi: float, v_sat: float
 ) -> _Axis1D | None:
-    """Bang-singular-bang profile saturating the velocity at ``v_sat`` (eq. 24)."""
+    """Return a capped minimum-time profile for one axis."""
     a_acc = u_hi if v_sat >= v0 else u_lo
     a_dec = u_hi if vf >= v_sat else u_lo
     if abs(a_acc) < 1e-12 or abs(a_dec) < 1e-12 or abs(v_sat) < 1e-12:
@@ -248,12 +229,7 @@ def fixed_time_1d(
     T_target: float,
     v_cap: float | None = None,
 ) -> _Axis1D | _CubicAxis1D:
-    """Profile reaching (pf, vf) in exactly ``T_target`` for axis synchronization.
-
-    A cubic Hermite stretches a non-critical (slack) axis to the critical axis's T* in closed form.
-    If even at full authority the axis cannot reach T_target, it is effectively critical and the
-    true bang-bang is returned instead.
-    """
+    """Return a profile that reaches the target state in the requested time."""
     if abs(pf - p0) < 1e-9 and abs(v0) < 1e-9 and abs(vf) < 1e-9:
         return _Axis1D(p0, 0.0, [(0.0, T_target)])
     full = min_time_1d(p0, v0, pf, vf, u_lo, u_hi, v_cap)
@@ -263,7 +239,7 @@ def fixed_time_1d(
 
 
 class MotionPrimitive:
-    """Time-optimal, axis-synchronized motion primitive between two point-mass states."""
+    """Represent a time-optimal primitive between two point-mass states."""
 
     def __init__(
         self,
@@ -274,7 +250,7 @@ class MotionPrimitive:
         u_max: np.ndarray,
         v_max: np.ndarray | None = None,
     ) -> None:
-        """Compute a time-optimal primitive between (p0, v0) and (pf, vf)."""
+        """Initialize the primitive from the given boundary states."""
         p0 = np.asarray(p0, dtype=np.float64)
         v0 = np.asarray(v0, dtype=np.float64)
         pf = np.asarray(pf, dtype=np.float64)
@@ -310,22 +286,19 @@ class MotionPrimitive:
                 self.n_cubic += isinstance(ax, _CubicAxis1D)
 
     def state_at(self, t: float) -> tuple[np.ndarray, np.ndarray]:
-        """Return (position, velocity) 3-vectors at time t."""
+        """Return the position and velocity at time t."""
         pv = [ax.state_at(t) for ax in self.axes]
         return np.array([p for p, _ in pv]), np.array([v for _, v in pv])
 
     def sample_positions(self, n: int) -> np.ndarray:
-        """Sample n positions uniformly in time over [0, T]. Returns (n, 3)."""
+        """Sample positions uniformly over the primitive duration."""
         return np.array([self.state_at(t)[0] for t in np.linspace(0.0, self.T, max(n, 2))])
 
 
-# ----------------------------------------------------------------------------------------
-# Sampling-based graph search (Sec. VI-B)
-# ----------------------------------------------------------------------------------------
 def _cone_directions(
     rng: np.random.Generator, axis: np.ndarray, half_angle: float, n: int
 ) -> np.ndarray:
-    """Sample n unit vectors uniformly within ``half_angle`` of ``axis``."""
+    """Sample unit vectors around the given axis."""
     axis = axis / (np.linalg.norm(axis) + 1e-12)
     ref = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
     e1 = np.cross(axis, ref)
@@ -343,7 +316,7 @@ def _cone_directions(
 
 
 class _GraphPlanner:
-    """Layered graph over sampled gate-crossing velocities, solved with Dijkstra."""
+    """Solve a layered graph of sampled gate-crossing states."""
 
     def __init__(
         self,
@@ -374,12 +347,10 @@ class _GraphPlanner:
         self.stats: dict = {}
         rng = np.random.default_rng(seed)
 
-        v_mag = float(v_max)  # largest sampled gate speed (as a norm)
+        v_mag = float(v_max)
         speed_lo = speed_lo_frac * v_mag
 
-        # Layer 0 is the start state. Per gate: a crossing layer at the center (sampled velocities)
-        # and, a short distance behind along each crossing direction, an EXIT layer (improvement
-        # 2a) that forces the path straight THROUGH the opening so the gate reliably counts.
+        # Build the start layer and one crossing layer per gate.
         self.layers: list[list[dict]] = [
             [{"pos": np.asarray(start_pos, float), "vel": np.asarray(start_vel, float)}]
         ]
@@ -414,14 +385,14 @@ class _GraphPlanner:
             )
 
     def _edge_ok(self, prim: MotionPrimitive) -> bool:
-        """True if the primitive's sampled points clear all obstacles (or no obstacles set)."""
+        """Return True when the primitive stays clear of obstacles."""
         if self.obs is None:
             return True
         pts = prim.sample_positions(self.n_collision_pts)
         return not bool(self.obs.points_in_obstacles(pts, margin=self.collision_margin).any())
 
     def solve(self) -> list[MotionPrimitive] | None:
-        """Return the minimum-time list of primitives through all gates, or None."""
+        """Return the minimum-time primitive chain through the gates."""
         node_ids: dict[tuple[int, int], int] = {}
         nodes: list[dict] = []
         for li, layer in enumerate(self.layers):
@@ -492,7 +463,7 @@ class _GraphPlanner:
             return None
         self.stats = {"cost": float(dist[sink])}
 
-        # Reconstruct the optimal route and build/collision-check only its primitives.
+        # Reconstruct the best route and check only its primitives.
         path_nodes = []
         cur = prev[sink]
         while cur is not None:
@@ -512,11 +483,8 @@ class _GraphPlanner:
         return prims
 
 
-# ----------------------------------------------------------------------------------------
-# Top-level planner: drop-in for TrajectoryPlanner
-# ----------------------------------------------------------------------------------------
 def _as_f64(a: np.ndarray | None, cols: int) -> np.ndarray | None:
-    """``a`` as a float64 array reshaped to (-1, cols), or None; cols=1 gives a flat array."""
+    """Return an array as float64 with the requested shape."""
     if a is None:
         return None
     a = np.asarray(a, dtype=np.float64)
@@ -524,11 +492,7 @@ def _as_f64(a: np.ndarray | None, cols: int) -> np.ndarray | None:
 
 
 class PointMassPlanner:
-    """PMM planner exposing the interface ``attitude_mpc.py`` consumes from ``TrajectoryPlanner``.
-
-    Builds a near time-optimal geometric path through the gates and refits it as a cubic spline
-    parameterized by true arc length.
-    """
+    """Expose the PMM planner through the trajectory-planner interface."""
 
     def __init__(
         self,
@@ -557,7 +521,7 @@ class PointMassPlanner:
         committed_suffix_pts: np.ndarray | None = None,
         committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
-        """Store tuning and run the first plan (see ``plan`` for the committed-segment args)."""
+        """Initialize the planner and run the first plan."""
         self._u_max = np.full(3, float(u_max)) if np.isscalar(u_max) else np.asarray(u_max, float)
         # v_max is a scalar SPEED (velocity norm), used both as the per-axis primitive cap and the
         # largest gate-crossing speed sampled, kept consistent with the MPCC's v_theta bound.
@@ -620,13 +584,7 @@ class PointMassPlanner:
         committed_suffix_pts: np.ndarray | None = None,
         committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
-        """Run the PMM graph search and build the arc-length spline.
-
-        ``committed_pts``/``committed_speeds`` are an optional near-field PREFIX from the previously
-        active trajectory (``start_pos`` is its end); ``committed_suffix_*`` an optional far-field
-        SUFFIX from the offline backbone. Both keep a replan continuous with the old reference.
-        Layout: [prefix] + [window primitives] + [suffix].
-        """
+        """Build a new path and fit it as an arc-length spline."""
         self._committed_pts = _as_f64(committed_pts, 3)
         self._committed_speeds = _as_f64(committed_speeds, 1)
         self._committed_suffix_pts = _as_f64(committed_suffix_pts, 3)
@@ -673,13 +631,7 @@ class PointMassPlanner:
     def _gate_normals(
         self, start_pos: np.ndarray, centers: list[np.ndarray], gate_rpys: np.ndarray | None
     ) -> list[np.ndarray]:
-        """Required crossing direction (unit vector) for each gate.
-
-        The env only counts a gate crossed in its +x direction ``[cos(yaw), sin(yaw), 0]``, so the
-        crossing velocity must point that way; the normal is deliberately NOT flipped toward the
-        approach (that could cross the wrong way and loop back). Falls back to a geometric estimate
-        when orientations are absent.
-        """
+        """Return the required crossing direction for each gate."""
         normals = []
         prev = start_pos
         for i, c in enumerate(centers):
@@ -702,7 +654,7 @@ class PointMassPlanner:
         prune: bool,
         single: bool = False,
     ) -> tuple[list[MotionPrimitive] | None, dict]:
-        """Build and solve the graph; returns (primitives or None, stats)."""
+        """Build and solve the graph for the current planning window."""
         gp = _GraphPlanner(
             start_pos=start_pos,
             start_vel=start_vel,
@@ -727,7 +679,7 @@ class PointMassPlanner:
     def _extend(
         self, pts: list[np.ndarray], spd: list[float], cpts: np.ndarray, cspeeds: np.ndarray | None
     ) -> None:
-        """Append committed points and their speeds (fall back to v_max when speeds are absent)."""
+        """Append committed points and speeds to the path buffer."""
         pts.extend(cpts)
         if cspeeds is not None and len(cspeeds) == len(cpts):
             spd.extend(float(s) for s in cspeeds)
@@ -737,11 +689,7 @@ class PointMassPlanner:
     def _build_spline_from_primitives(
         self, prims: list[MotionPrimitive], final_normal: np.ndarray | None
     ) -> None:
-        """Sample primitives (and any committed prefix/suffix), resample at uniform arc length, fit.
-
-        The PMM speed |v(t)| is mapped onto arc length and kept as ``_speed_profile``; for an
-        arc-length path |v| equals ds/dt, i.e. the progress speed exported via ``evaluate_speed``.
-        """
+        """Sample the primitive path and fit the arc-length spline."""
         pts: list[np.ndarray] = []
         spd: list[float] = []
         has_prefix = self._committed_pts is not None and len(self._committed_pts) > 0
@@ -811,44 +759,44 @@ class PointMassPlanner:
     # -- public API consumed by attitude_mpc.py -------------------------------------------
     @property
     def total_length(self) -> float:
-        """Total arc length of the planned trajectory."""
+        """Return the total arc length of the planned trajectory."""
         return self._s_total
 
     @property
     def knot_points(self) -> np.ndarray:
-        """Spline knot points (arc-length values) used for segment indexing."""
+        """Return the spline knot points in arc length."""
         return self._s
 
     @property
     def waypoints_pos(self) -> np.ndarray:
-        """Fine-grained sampled positions along the path."""
+        """Return the sampled positions along the path."""
         return self._waypoints_pos
 
     def final_waypoint(self) -> np.ndarray:
-        """Final position at the end of the spline."""
+        """Return the final position at the end of the spline."""
         return self._des_pos_spline(self._s_total)
 
     def evaluate(self, s: float | np.ndarray) -> np.ndarray:
-        """Path position at arc-length parameter s."""
+        """Return the path position at arc length s."""
         return self._des_pos_spline(s)
 
     def evaluate_velocity(self, s: float | np.ndarray) -> np.ndarray:
-        """Path tangent dp/ds at arc-length parameter s."""
+        """Return the path tangent at arc length s."""
         return self._des_vel_spline(s)
 
     def evaluate_speed(self, s: float | np.ndarray) -> np.ndarray | float:
-        """PMM speed (m/s) at arc-length parameter s (== ds/dt, the MPCC's v_theta reference)."""
+        """Return the planned speed at arc length s."""
         return np.interp(s, self._s, self._speed_profile)
 
     def nearest_theta(self, pos: np.ndarray) -> float:
-        """Arc-length parameter of the path point nearest to ``pos``."""
+        """Return the arc length of the path point nearest to pos."""
         idx = int(np.argmin(np.linalg.norm(self._waypoints_pos - pos, axis=1)))
         return float(self._s_total * idx / max(self._n_eval_points - 1, 1))
 
     def get_polynomial_coeffs_at(
         self, theta_pred: float
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """Per-segment cubic coefficients (scipy CubicSpline layout) and the segment's left knot."""
+        """Return the cubic coefficients for the segment at theta_pred."""
         theta_pred = float(np.clip(theta_pred, self._s[0], self._s[-1]))
         seg_idx = int(np.searchsorted(self._s[1:], theta_pred, side="right"))
         seg_idx = min(max(seg_idx, 0), len(self._s) - 2)
@@ -868,11 +816,7 @@ class PointMassPlanner:
         committed_suffix_speeds: np.ndarray | None = None,
         n_vel_samples: int | None = None,
     ) -> PointMassPlanner:
-        """Build a new planner with identical tuning but a fresh path (does not mutate self).
-
-        Used by ``AsyncPMMReplanner`` with snapshots captured on the control thread, so the worker
-        never reads shared mutable state. ``n_vel_samples`` overrides the sample count.
-        """
+        """Build a new planner with the same tuning but a fresh path."""
         kwargs = dict(self._kwargs)
         kwargs["obstacle_manager"] = obstacle_manager
         if n_vel_samples is not None:
@@ -890,34 +834,22 @@ class PointMassPlanner:
         )
 
 
-# ----------------------------------------------------------------------------------------
-# Asynchronous (off-control-thread) replanning
-# ----------------------------------------------------------------------------------------
 class AsyncPMMReplanner:
-    """Runs PMM replans on a background thread so the 50 Hz control loop never blocks.
-
-    A full plan costs ~100-200 ms; the controller keeps flying on the current planner while a
-    replan runs in the background::
-
-        request(build_fn)   # control thread, non-blocking
-        take() -> planner   # control thread, picks up the result later (or None)
-
-    ``build_fn`` is a zero-argument closure capturing snapshots taken on the control thread.
-    """
+    """Run PMM replans on a background thread without blocking the control loop."""
 
     def __init__(self) -> None:
-        """Initialize the replanner (no plan running yet)."""
+        """Initialize the replanner."""
         self._lock = threading.Lock()
         self._ready: PointMassPlanner | None = None
         self._busy = False
 
     def busy(self) -> bool:
-        """True while a background plan is in flight."""
+        """Return True while a background plan is in flight."""
         with self._lock:
             return self._busy
 
     def request(self, build_fn: Callable[[], PointMassPlanner]) -> bool:
-        """Start a background replan; no-op (returns False) if one is already running."""
+        """Start a background replan if one is not already running."""
         with self._lock:
             if self._busy:
                 return False
@@ -926,7 +858,7 @@ class AsyncPMMReplanner:
         return True
 
     def _run(self, build_fn: Callable[[], PointMassPlanner]) -> None:
-        """Worker body: run ``build_fn`` and store the result (None on any failure)."""
+        """Run the build function and store the result."""
         try:
             result = build_fn()
         except Exception:
@@ -936,7 +868,7 @@ class AsyncPMMReplanner:
             self._busy = False
 
     def take(self) -> PointMassPlanner | None:
-        """Return a finished planner if ready (clearing it), else None."""
+        """Return a finished planner if one is ready."""
         with self._lock:
             result, self._ready = self._ready, None
             return result

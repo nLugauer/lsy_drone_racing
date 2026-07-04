@@ -2,7 +2,7 @@
 
 Models gates as capsule obstacles, exposes collision queries for the PMM planner, dynamic
 contour weighting for the MPCC cost, and CasADi hard-constraint expressions. All obstacles
-are capsules (cylinders); spheres are not used.
+are capsules (cylinders)
 """
 
 from __future__ import annotations
@@ -20,11 +20,7 @@ class ObstacleManager:
     """Manages obstacles, gates, collision detection, and MPCC cost shaping."""
 
     def __init__(self, safety_margin: float = 0.08) -> None:
-        """Initialize the manager.
-
-        Args:
-            safety_margin: Extra buffer distance (meters) added around every obstacle.
-        """
+        """Initialize the obstacle manager."""
         self.safety_margin = safety_margin
         self.obstacles: list[dict] = []
         self.gates: list[dict] = []
@@ -35,24 +31,12 @@ class ObstacleManager:
         self._q_nom = 1.0
         self._q_wp = 10
         self._sigma_sq = 0.35**2
-        self._enable_qc_scaling = False
 
-        # Gate opening corridor (PMM pruning only, NOT the MPCC constraints): a short tube through
-        # each opening that points_in_obstacles treats as free space, biasing the planner to thread
-        # the opening instead of being repelled around the frame.
         self._opening_margin = 0.05  # [m] shrink corridor radius in from the clear half-width
         self._opening_half_depth = 0.25  # [m] half-length of the corridor along the gate normal
 
-        # Adaptive contour weight: scale a gate's q_c bump by how far its revealed position moved
-        # from the nominal one the trajectory was planned through. Large move -> smaller bump, so
-        # the controller may leave the stale nominal line and let the collision constraints thread
-        # the true opening.
-        self._qc_err_full = 0.05  # [m] error at/below which the full bump is kept (scale = 1)
-        self._qc_err_zero = 0.20  # [m] error at/above which the bump is at its floor
-        self._qc_scale_min = 0.15  # floor (>0) so a gentle pull toward center always remains
-
     def add_cylinder(self, start: np.ndarray, end: np.ndarray, radius: float) -> None:
-        """Add a capsule obstacle with axis from ``start`` to ``end`` and the given radius."""
+        """Add a capsule obstacle with the given endpoints and radius."""
         self.obstacles.append(
             {
                 "p1": np.array(start, dtype=np.float64),
@@ -64,7 +48,7 @@ class ObstacleManager:
     def _frame_capsules(
         self, center: np.ndarray, yaw: float, inner_width: float, outer_width: float
     ) -> list[dict]:
-        """Build the 4 capsules modelling a gate's solid banner frame."""
+        """Build the four capsules that model a gate frame."""
         banner_offset = (inner_width / 4.0) + (outer_width / 4.0)
         thickness = (outer_width - inner_width) / 4.0
         local_corners = [
@@ -81,11 +65,7 @@ class ObstacleManager:
         ]
 
     def _lower_cylinder(self, center: np.ndarray, outer_width: float, radius: float) -> dict:
-        """Vertical cylinder below a gate's opening so the drone cannot fly under the gate.
-
-        Spans from the ground to just below the opening (center_z - outer_width/2); the top is kept
-        below the opening so its capsule end-cap does not intrude into the legitimate crossing.
-        """
+        """Build the lower capsule obstacle below a gate opening."""
         z_top = max(float(center[2]) - outer_width / 2.0, 0.05)
         return {
             "p1": np.array([center[0], center[1], 0.0], dtype=np.float64),
@@ -95,7 +75,7 @@ class ObstacleManager:
         }
 
     def _opening_corridor(self, center: np.ndarray, yaw: float, inner_width: float) -> dict:
-        """Free-space tube through a gate's opening (used only by PMM collision pruning)."""
+        """Build the free-space corridor through a gate opening."""
         return {
             "center": np.array(center, dtype=np.float64),
             "axis": np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float64),
@@ -111,15 +91,7 @@ class ObstacleManager:
         outer_width: float = 0.72,
         lower_frame_radius: float = 0.20,
     ) -> None:
-        """Model a gate as 4 banner-frame capsules plus a lower-frame cylinder below the opening.
-
-        Args:
-            pos: [x, y, z] gate center (z is the opening center height).
-            rpy: [roll, pitch, yaw] orientation in radians.
-            inner_width: Width/height of the opening.
-            outer_width: Outer width/height of the frame.
-            lower_frame_radius: Radius of the vertical cylinder below the opening.
-        """
+        """Add a gate to the obstacle manager."""
         center = np.array(pos, dtype=np.float64)
         yaw = float(rpy[2])
 
@@ -134,9 +106,6 @@ class ObstacleManager:
         self.gates.append(
             {
                 "pos": center,
-                # Position the trajectory was planned through. Frozen at construction (nominal) and
-                # never overwritten, so dynamic_contour_weight can measure how far a gate has moved.
-                "nominal_pos": center.copy(),
                 "rpy": np.array(rpy, dtype=np.float64),
                 "inner_width": inner_width,
                 "outer_width": outer_width,
@@ -145,14 +114,7 @@ class ObstacleManager:
         )
 
     def add_pole(self, pos: list | np.ndarray, height: float = 1.55, radius: float = 0.015) -> None:
-        """Add a pole as a vertical capsule.
-
-        Args:
-            pos: [x, y, z_top] top position (dict with a ``pos`` key is also accepted), or an
-                (x, y, z_top) array.
-            height: Total height from ground to top.
-            radius: Pole radius in meters.
-        """
+        """Add a pole obstacle."""
         if isinstance(pos, dict):
             pos = pos["pos"]
         pos_arr = np.asarray(pos, dtype=np.float64)
@@ -166,12 +128,7 @@ class ObstacleManager:
         )
 
     def update_gate_positions(self, gate_positions: np.ndarray, gate_rpys: np.ndarray) -> None:
-        """Move the gate capsules/openings in place to the new positions (no re-planning).
-
-        Args:
-            gate_positions: (N, 3) new gate positions.
-            gate_rpys: (N, 3) new gate orientations [roll, pitch, yaw].
-        """
+        """Update gate positions and orientations in place."""
         gate_positions = np.asarray(gate_positions, dtype=np.float64)
         gate_rpys = np.asarray(gate_rpys, dtype=np.float64)
 
@@ -196,7 +153,7 @@ class ObstacleManager:
             gate["rpy"] = np.array(gate_rpys[gate_idx], dtype=np.float64)
 
     def update_pole_positions(self, pole_positions: np.ndarray, height: float = 1.55) -> None:
-        """Move the pole capsules in place to the new [x, y, z_top] positions (no re-planning)."""
+        """Update pole positions in place."""
         pole_positions = np.asarray(pole_positions, dtype=np.float64)
         for i, pole_idx in enumerate(self._pole_obstacle_indices):
             if i >= pole_positions.shape[0]:
@@ -208,15 +165,7 @@ class ObstacleManager:
     def snapshot(
         self, exclude_gate_centers: np.ndarray | None = None, exclude_tol: float = 0.3
     ) -> ObstacleManager:
-        """Return a frozen, independent copy for thread-safe collision queries.
-
-        The control thread updates obstacle positions every tick while the background PMM replanner
-        reads them through points_in_obstacles; handing it this copy gives it a consistent set.
-
-        ``exclude_gate_centers`` drops the 4 frame capsules of every gate whose center is within
-        ``exclude_tol`` (m) of any listed center, so the planner routing THROUGH those gates is not
-        rejected for flying through their openings. The MPCC keeps the full obstacle set.
-        """
+        """Create a frozen snapshot of the current obstacles for the planner."""
         exclude_idx: set[int] = set()
         if exclude_gate_centers is not None:
             ec = np.asarray(exclude_gate_centers, dtype=np.float64).reshape(-1, 3)
@@ -245,7 +194,7 @@ class ObstacleManager:
         return snap
 
     def _points_in_openings(self, points: np.ndarray) -> np.ndarray:
-        """Boolean mask of points lying inside ANY gate opening corridor."""
+        """Return a boolean mask for points inside any gate opening."""
         inside = np.zeros(points.shape[0], dtype=bool)
         for op in self._gate_openings:
             d = points - op["center"]
@@ -255,23 +204,12 @@ class ObstacleManager:
         return inside
 
     def points_in_obstacles(self, points: np.ndarray, margin: float | None = None) -> np.ndarray:
-        """Return a boolean mask of the query points that intersect an obstacle (within margin).
-
-        Args:
-            points: (N, 3) query points.
-            margin: Collision margin; defaults to ``self.safety_margin``.
-
-        Returns:
-            Boolean array (N,), True where a point intersects an obstacle. Points inside a gate's
-            opening corridor are exempt from that gate's frame repulsion.
-        """
+        """Return a boolean mask for points that intersect any obstacle."""
         points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         mask = np.zeros(points.shape[0], dtype=bool)
         margin = self.safety_margin if margin is None else float(margin)
         in_opening = self._points_in_openings(points) if self._gate_openings else None
 
-        # Vectorized over the (many) points, looping only over the (few) capsules — the hot path of
-        # PMM collision pruning.
         for obs in self.obstacles:
             if mask.all():
                 break
@@ -288,39 +226,10 @@ class ObstacleManager:
             mask |= hit
         return mask
 
-    def _gate_contour_scale(self, gate: dict) -> float:
-        """Scale a gate's contour-weight bump by how far it moved from its nominal position.
-
-        Returns a factor in ``[_qc_scale_min, 1.0]``, linear in the position error between
-        ``_qc_err_full`` and ``_qc_err_zero``. Close to nominal -> full bump (hug the center);
-        far from nominal -> reduced bump (let the collision constraints thread the true opening).
-        """
-        if self._enable_qc_scaling is False:
-            return 1.0
-        nominal = gate.get("nominal_pos")
-        if nominal is None:
-            return 1.0
-        err = float(np.linalg.norm(gate["pos"] - nominal))
-        if err <= self._qc_err_full:
-            return 1.0
-        if err >= self._qc_err_zero:
-            return self._qc_scale_min
-        frac = (err - self._qc_err_full) / (self._qc_err_zero - self._qc_err_full)
-        return 1.0 + frac * (self._qc_scale_min - 1.0)
-
     def dynamic_contour_weight(
         self, position: np.ndarray, target_gate_idx: int | None = None
     ) -> float:
-        """Contour weight q_c raised near gates for soft obstacle avoidance in the MPCC cost.
-
-        Args:
-            position: Current drone position [x, y, z].
-            target_gate_idx: If given (and valid), only the next gate contributes; otherwise all
-                gates do.
-
-        Returns:
-            Contour weight q_c (a Gaussian bump per gate, scaled by ``_gate_contour_scale``).
-        """
+        """Compute the contour-weight bump near gates."""
         if target_gate_idx is not None and 0 <= target_gate_idx < len(self.gates):
             gates = [self.gates[target_gate_idx]]
         else:
@@ -328,12 +237,11 @@ class ObstacleManager:
         q_c = self._q_nom
         for gate in gates:
             dist_sq = float(np.sum((position - gate["pos"]) ** 2))
-            gain = self._gate_contour_scale(gate) * self._q_wp
-            q_c += gain * float(np.exp(-0.5 * dist_sq / self._sigma_sq))
+            q_c += self._q_wp * float(np.exp(-0.5 * dist_sq / self._sigma_sq))
         return float(q_c)
 
     def get_obstacle_parameters(self) -> np.ndarray:
-        """Flatten obstacle endpoints into ``[p1_x, p1_y, p1_z, p2_x, p2_y, p2_z, ...]``."""
+        """Flatten obstacle endpoints into a parameter vector."""
         params = []
         for obs in self.obstacles:
             params.extend(obs["p1"])
@@ -341,20 +249,7 @@ class ObstacleManager:
         return np.array(params, dtype=np.float64)
 
     def get_collision_expressions(self, x_sym: ca.MX, p_sym: ca.MX) -> ca.MX:
-        """CasADi collision constraints ``dist - (radius + margin) >= 0`` (one per obstacle).
-
-        Signed distance (not the squared form) is used for solver conditioning: its position
-        gradient is the unit surface normal everywhere and the SQP slack is the penetration in
-        meters, so a given intrusion costs the same regardless of obstacle size. ``dist`` is
-        ``sqrt(dist_sq + eps)``; eps only smooths the never-reached on-axis singularity.
-
-        Args:
-            x_sym: State vector (x[0:3] is the drone position).
-            p_sym: Parameter vector of obstacle endpoints (6 per obstacle).
-
-        Returns:
-            Column vector of constraint expressions.
-        """
+        """Build collision constraints for the MPC solver."""
         constraints = []
         drone_pos = x_sym[0:3]
         eps = 1e-6
@@ -370,7 +265,7 @@ class ObstacleManager:
     def render(
         self, sim: Sim, rgba: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.3)
     ) -> None:
-        """Draw all obstacle capsules in the simulator."""
+        """Render all obstacle capsules in the simulator."""
         from crazyflow.sim.visualize import draw_capsule
 
         for obs in self.obstacles:
