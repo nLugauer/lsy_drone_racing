@@ -573,7 +573,8 @@ class AttitudeMPC(Controller):
             start_pos = np.array(obs["pos"], dtype=np.float64)
             start_vel = np.array(obs["vel"], dtype=np.float64)
 
-        # Far-field suffix: reuse the offline backbone beyond the replan window (if number of gates is smaller than total number of gates)
+        # Far-field suffix: reuse the offline backbone beyond the replan window
+        # (if number of gates is smaller than total number of gates)
         committed_suffix_pts = committed_suffix_speeds = None
         if self._backbone is not None and window.stop < len(gates_pos):
             bb = self._backbone
