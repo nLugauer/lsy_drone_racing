@@ -123,10 +123,12 @@ def simulate(
                     time.sleep(1.0 / fps)
             i += 1
 
-        controller.episode_callback()  # Update the controller internal state and models.
-        log_episode_stats(obs, info, config, curr_time)
+        # Write telemetry BEFORE episode_callback(), which clears the
+        # controller's _log_* lists.
         if recorder is not None:
             recorder.finish(controller, obs, curr_time)
+        controller.episode_callback()  # Update the controller internal state and models.
+        log_episode_stats(obs, info, config, curr_time)
         controller.episode_reset()
         ep_times.append(curr_time if obs["target_gate"] == -1 else None)
 
