@@ -216,10 +216,10 @@ def create_ocp_solver(
 class AttitudeMPC(Controller):
     """MPCC controller using the collective-thrust and attitude interface."""
 
-    USE_PMM_PLANNER = True
+    USE_PMM_PLANNER = False
 
     # Online replanning: True -> replan the reference as gates are revealed; False -> OG track
-    PMM_REPLAN = True
+    PMM_REPLAN = False
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the controller.

@@ -1,0 +1,1 @@
+plan_id,t_trigger,is_replan,plan_time_ms,n_vel_samples,horizon,path_length,cost,min_clearance,n_cubic,fallback

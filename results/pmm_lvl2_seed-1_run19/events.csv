@@ -1,0 +1,5 @@
+t,event_type,gate_idx,detail
+1.56,gate_passed,0,
+2.32,gate_passed,1,
+3.66,gate_passed,2,
+4.62,gate_passed,3,
