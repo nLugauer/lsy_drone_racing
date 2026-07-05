@@ -12,8 +12,6 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import CubicSpline
 
@@ -27,79 +25,58 @@ if TYPE_CHECKING:
 logger = logging.getLogger("lsy_drone_racing.pmm")
 
 
-def _jax_edge_cost_base(
-    p0: jax.Array, v0: jax.Array, pf: jax.Array, vf: jax.Array, u_max: jax.Array, v_cap: jax.Array
-) -> jax.Array:
-    """Compute the minimum-time edge cost for a single primitive."""
-    dp = pf - p0
+def _edge_cost_matrix(
+    pA: np.ndarray,
+    vA: np.ndarray,
+    pB: np.ndarray,
+    vB: np.ndarray,
+    u_max: np.ndarray,
+    v_cap: np.ndarray,
+) -> np.ndarray:
+    """Axis-synchronized minimum time T* for every edge from layer A to layer B.
 
-    def _solve_axis(
-        dp_ax: jax.Array,
-        v0_ax: jax.Array,
-        vf_ax: jax.Array,
-        u_max_ax: jax.Array,
-        v_cap_ax: jax.Array,
-    ) -> jax.Array:
-        # Two bang-bang sequences: (+u, -u) and (-u, +u). dp = A t1^2 + B t1 + C per sequence.
-        a1_seq = jnp.array([u_max_ax, -u_max_ax])
-        a2_seq = jnp.array([-u_max_ax, u_max_ax])
-        A = a1_seq * (a2_seq - a1_seq) / (2.0 * a2_seq)
-        B = v0_ax * (a2_seq - a1_seq) / a2_seq
-        C = (vf_ax**2 - v0_ax**2) / (2.0 * a2_seq) - dp_ax
+    Vectorized over all KA*KB edges, the 3 axes, and the 4 bang-bang candidates (2 accel sequences
+    (+u,-u)/(-u,+u), each with its 2 quadratic roots), inserting a velocity-capped cruise where the
+    peak speed exceeds ``v_cap``. Returns a (KA, KB) matrix, np.inf where infeasible.
+    Foehn et al. 2021, Sec. VI-A (eqs. 23-24).
+    """
+    dp = (pB[None, :, :] - pA[:, None, :])[..., None]  # (KA, KB, 3, 1)
+    v0 = vA[:, None, :, None]
+    vf = vB[None, :, :, None]
+    u = u_max[:, None]  # (3, 1): per-axis accel magnitude
+    vc = v_cap[:, None]
+    a1 = u * np.array([1.0, 1.0, -1.0, -1.0])  # (3, 4): sequence x root
+    a2 = u * np.array([-1.0, -1.0, 1.0, 1.0])
+    root = np.array([1.0, -1.0, 1.0, -1.0])
 
-        disc = B**2 - 4.0 * A * C
-        valid_disc = disc >= 0.0
-        sq = jnp.sqrt(jnp.maximum(disc, 0.0))
+    # Bang-bang: dp = A t1^2 + B t1 + C per sequence.
+    A = a1 * (a2 - a1) / (2.0 * a2)
+    B = v0 * (a2 - a1) / a2
+    C = (vf**2 - v0**2) / (2.0 * a2) - dp
+    disc = B**2 - 4.0 * A * C
+    t1 = (-B + root * np.sqrt(np.maximum(disc, 0.0))) / (2.0 * A)
+    t2 = (vf - v0 - a1 * t1) / a2
+    valid = (disc >= 0.0) & (t1 >= -1e-4) & (t2 >= -1e-4)
+    t1 = np.maximum(t1, 0.0)
+    T_bb = np.where(valid, t1 + np.maximum(t2, 0.0), np.inf)
 
-        # 4 candidate roots for t1 (2 sequences x 2 quadratic roots).
-        t1_cands = jnp.array(
-            [
-                (-B[0] + sq[0]) / (2.0 * A[0]),
-                (-B[0] - sq[0]) / (2.0 * A[0]),
-                (-B[1] + sq[1]) / (2.0 * A[1]),
-                (-B[1] - sq[1]) / (2.0 * A[1]),
-            ]
-        )
-        valid_disc_cands = jnp.array([valid_disc[0], valid_disc[0], valid_disc[1], valid_disc[1]])
-        a1_cands = jnp.array([a1_seq[0], a1_seq[0], a1_seq[1], a1_seq[1]])
-        a2_cands = jnp.array([a2_seq[0], a2_seq[0], a2_seq[1], a2_seq[1]])
-
-        t2_cands = (vf_ax - v0_ax - a1_cands * t1_cands) / a2_cands
-        valid_bb = valid_disc_cands & (t1_cands >= -1e-4) & (t2_cands >= -1e-4)
-        t1_cands = jnp.maximum(t1_cands, 0.0)
-        t2_cands = jnp.maximum(t2_cands, 0.0)
-        T_bb = jnp.where(valid_bb, t1_cands + t2_cands, jnp.inf)
-
-        # Bang-singular-bang: insert a velocity-capped cruise when the peak exceeds v_cap (eq. 24).
-        v_peak = v0_ax + a1_cands * t1_cands
-        needs_cap = valid_bb & (jnp.abs(v_peak) > v_cap_ax)
-        v_sat = jnp.sign(v_peak) * v_cap_ax
-        v_sat_safe = jnp.where(jnp.abs(v_sat) < 1e-6, 1e-6, v_sat)
-        a_acc = jnp.where(v_sat >= v0_ax, u_max_ax, -u_max_ax)
-        a_dec = jnp.where(vf_ax >= v_sat, u_max_ax, -u_max_ax)
-        t1_c = (v_sat - v0_ax) / a_acc
-        t3_c = (vf_ax - v_sat) / a_dec
-        d1 = (v_sat**2 - v0_ax**2) / (2.0 * a_acc)
-        d3 = (vf_ax**2 - v_sat**2) / (2.0 * a_dec)
-        t2_c = (dp_ax - d1 - d3) / v_sat_safe
-        valid_cap = (t1_c >= -1e-4) & (t2_c >= -1e-4) & (t3_c >= -1e-4)
-        T_cap = jnp.where(
-            valid_cap,
-            jnp.maximum(t1_c, 0.0) + jnp.maximum(t2_c, 0.0) + jnp.maximum(t3_c, 0.0),
-            jnp.inf,
-        )
-
-        return jnp.min(jnp.where(needs_cap, T_cap, T_bb))
-
-    return jnp.max(jax.vmap(_solve_axis)(dp, v0, vf, u_max, v_cap))
-
-
-_jax_edge_cost = jax.jit(
-    jax.vmap(
-        jax.vmap(_jax_edge_cost_base, in_axes=(None, None, 0, 0, None, None)),
-        in_axes=(0, 0, None, None, None, None),
+    # Bang-singular-bang: velocity-capped cruise where the peak exceeds v_cap.
+    v_peak = v0 + a1 * t1
+    v_sat = np.sign(v_peak) * vc
+    a_acc = np.where(v_sat >= v0, u, -u)
+    a_dec = np.where(vf >= v_sat, u, -u)
+    t1c = (v_sat - v0) / a_acc
+    t3c = (vf - v_sat) / a_dec
+    d1 = (v_sat**2 - v0**2) / (2.0 * a_acc)
+    d3 = (vf**2 - v_sat**2) / (2.0 * a_dec)
+    t2c = (dp - d1 - d3) / np.where(np.abs(v_sat) < 1e-6, 1e-6, v_sat)
+    valid_cap = (t1c >= -1e-4) & (t2c >= -1e-4) & (t3c >= -1e-4)
+    T_cap = np.where(
+        valid_cap, np.maximum(t1c, 0.0) + np.maximum(t2c, 0.0) + np.maximum(t3c, 0.0), np.inf
     )
-)
+
+    needs_cap = valid & (np.abs(v_peak) > vc)
+    return np.where(needs_cap, T_cap, T_bb).min(axis=3).max(axis=2)
 
 
 class _Axis1D:
@@ -402,8 +379,6 @@ class _GraphPlanner:
         sink = len(nodes)
 
         adj: list[list[tuple[int, float]]] = [[] for _ in range(sink + 1)]
-        u_max_jnp = jnp.array(self.u_max)
-        v_cap_jnp = jnp.array(self.v_axis_cap)
 
         for li in range(len(self.layers) - 1):
             layer_A, layer_B = self.layers[li], self.layers[li + 1]
@@ -412,12 +387,7 @@ class _GraphPlanner:
             vA = np.asarray([a["vel"] for a in layer_A], dtype=np.float64)
             vB = np.asarray([b["vel"] for b in layer_B], dtype=np.float64)
 
-            # Batched min-time cost on the GPU, transferred to CPU once.
-            cost = np.array(
-                _jax_edge_cost(
-                    jnp.array(pA), jnp.array(vA), jnp.array(pB), jnp.array(vB), u_max_jnp, v_cap_jnp
-                )
-            )
+            cost = _edge_cost_matrix(pA, vA, pB, vB, self.u_max, self.v_axis_cap)
 
             # Improvement 2b: penalize edges whose endpoint velocities deviate from the straight
             # chord pA->pB (sharp turns the real quadrotor tracks poorly), and hard-reject bends
