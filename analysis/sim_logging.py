@@ -65,9 +65,14 @@ class SimRecorder:
         """Call once per control tick with the wall-clock cost of compute_control."""
         try:
             pos = obs.get("pos") if hasattr(obs, "get") else None
+            vel = obs.get("vel") if hasattr(obs, "get") else None
             if pos is not None and len(pos) >= 3:
+                if vel is not None and len(vel) >= 3:
+                    vx, vy, vz = float(vel[0]), float(vel[1]), float(vel[2])
+                else:
+                    vx = vy = vz = float("nan")
                 self._traj.append((t, float(pos[0]), float(pos[1]),
-                                   float(pos[2])))
+                                   float(pos[2]), vx, vy, vz))
             self._control_ms.append(float(control_ms))
             # Detect gate passes via the target-gate index advancing.
             tg = int(obs["target_gate"])
@@ -116,10 +121,9 @@ class SimRecorder:
             for i, ms in enumerate(self._control_ms):
                 log.record_solve(i * self.dt, ms)
 
-            # 3) trajectory (drone position over time).
-            for (t, x, y, z) in self._traj:
-                log.record_state(t, [x, y, z],
-                                 [float("nan")] * 3, s=float("nan"))
+            # 3) trajectory (drone position + velocity over time).
+            for (t, x, y, z, vx, vy, vz) in self._traj:
+                log.record_state(t, [x, y, z], [vx, vy, vz], s=float("nan"))
 
             # 4) gate-pass events.
             for (t, kind, gate_idx) in self._events:
@@ -132,11 +136,48 @@ class SimRecorder:
             success = self.n_gates > 0 and gates_passed == self.n_gates
             run_dir = log.finish(lap_time=curr_time,
                                  gates_passed=gates_passed, success=success)
+
+            # 6) track geometry, so the overlay plot can draw gates/obstacles
+            #    without a separate track file.
+            self._write_track(run_dir, obs)
+
             print(f"[analysis] wrote {run_dir}")
             return run_dir
         except Exception as exc:
             print(f"[analysis] finish() failed, no logs written: {exc}")
             return None
+
+    @staticmethod
+    def _write_track(run_dir: Optional[str], obs: Dict[str, Any]) -> None:
+        """Write gate/obstacle positions to <run_dir>/track.csv (kind,x,y,z).
+
+        Uses the final observation, so gate positions reflect the revealed
+        (true) track. Fails soft if the keys are absent.
+        """
+        if not run_dir:
+            return
+        import csv
+        rows = []
+        for key, kind in (("gates_pos", "gate"), ("obstacles_pos", "obstacle")):
+            arr = obs.get(key) if hasattr(obs, "get") else None
+            if arr is None:
+                continue
+            for p in arr:
+                try:
+                    rows.append((kind, float(p[0]), float(p[1]),
+                                 float(p[2]) if len(p) > 2 else float("nan")))
+                except Exception:
+                    continue
+        if not rows:
+            return
+        try:
+            with open(os.path.join(run_dir, "track.csv"), "w",
+                      newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["kind", "x", "y", "z"])
+                w.writerows(rows)
+        except Exception as exc:
+            print(f"[analysis] could not write track.csv: {exc}")
 
 
 def _col(obj: Any, name: str, n: int) -> List[float]:

@@ -24,8 +24,10 @@ configs) — aim for >=10 per level/planner.
 - `tracking`/`control`: from the controller's existing `self._log_*` lists.
 - `mpc_solve`: wall-clock time of each `compute_control` call (proxy for MPC
   solve time).
-- `trajectory`: drone position from `obs["pos"]`.
+- `trajectory`: drone position and velocity from `obs["pos"]` / `obs["vel"]`.
 - `events`: gate passes (detected from `obs["target_gate"]` advancing).
+- `track.csv`: gate and obstacle positions (so the overlay plot can draw the
+  track without a separate config file).
 - `runs_summary`: lap time, gates passed, success, mean/max solve time, etc.
 
 ### Not captured yet (plots skip gracefully)
@@ -44,6 +46,17 @@ python make_all_plots.py --results ../results --out ../figures \
 Writes publication-quality PDF+PNG figures into `../figures/`. Aggregate plots
 (lap time, success rate, solve-time histogram, planner runtime, clearance) use
 every run under `--results`; single-run plots use the named runs.
+
+For a single run's **speed/position track overlay** (path coloured by speed,
+gates and obstacles drawn from that run's `track.csv`):
+
+```bash
+python plot_track_overlay.py --run ../results/pmm_lvl2_seed3_run0 --out ../figures
+```
+
+Run it once per run (e.g. the PMM run and the baseline run) to compare lines.
+This shows the *flown* path and *flown* speed, not the planner's internal
+speed profile (the reference path is not logged yet).
 
 Dependencies: matplotlib, pandas, numpy (no seaborn). `plotting.py` and
 `plot_style.py` are imported by `make_all_plots.py` — run that, not them.

@@ -83,6 +83,7 @@ def main() -> None:
         P.plot_control_inputs(single, out)
         P.plot_gate_timestamps(single, out)
         P.plot_optimization_loss(single, out)
+        P.plot_track_speed_overlay(single, out)
 
     # --- trajectory comparison (needs both runs) ---
     if args.pmm_run and args.baseline_run:

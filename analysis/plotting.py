@@ -85,6 +85,97 @@ def plot_trajectory_comparison(pmm_run_dir: str, baseline_run_dir: str,
     save(fig, out_dir, name)
 
 
+def plot_track_speed_overlay(run_dir: str, out_dir: str,
+                             obstacle_radius: float = 0.05,
+                             obstacles: Optional[np.ndarray] = None,
+                             gates: Optional[np.ndarray] = None,
+                             name: str = "track_speed_overlay") -> None:
+    """Top-down flown path, colour-coded by speed, over the track.
+
+    Speed is taken from the logged velocity (vx, vy, vz) if present, otherwise
+    estimated by finite-differencing position. Gates and obstacles are read
+    from ``<run_dir>/track.csv`` when available; ``obstacles`` (N,3 = x,y,r)
+    and ``gates`` (M,2 = x,y) override that if passed explicitly.
+
+    Shows the *flown* path and *flown* speed for a single run -- useful for
+    seeing where the vehicle accelerates on straights and slows into turns,
+    and for comparing the PMM run against the baseline run.
+    """
+    from matplotlib.collections import LineCollection
+
+    apply_style()
+    traj = _stream(run_dir, "trajectory")
+    if traj is None or len(traj) < 2:
+        warnings.warn("trajectory too short for speed overlay")
+        return
+    x, y = traj.x.to_numpy(), traj.y.to_numpy()
+
+    # Speed: prefer logged velocity, else finite-difference the position.
+    vcols = {"vx", "vy", "vz"}
+    if vcols.issubset(traj.columns) and traj[list(vcols)].notna().any().any():
+        speed = np.sqrt(traj.vx ** 2 + traj.vy ** 2 + traj.vz ** 2).to_numpy()
+        speed_src = "logged"
+    else:
+        t = traj.t.to_numpy()
+        z = traj.z.to_numpy()
+        speed = np.sqrt(np.gradient(x, t) ** 2 + np.gradient(y, t) ** 2
+                        + np.gradient(z, t) ** 2)
+        speed_src = "finite-diff"
+
+    # Track geometry: explicit args win, else load track.csv from the run.
+    if obstacles is None or gates is None:
+        track = _load(os.path.join(run_dir, "track.csv"))
+        if track is not None:
+            if gates is None:
+                g = track[track.kind == "gate"]
+                gates = g[["x", "y"]].to_numpy() if len(g) else None
+            if obstacles is None:
+                o = track[track.kind == "obstacle"]
+                if len(o):
+                    obstacles = np.column_stack(
+                        [o.x.to_numpy(), o.y.to_numpy(),
+                         np.full(len(o), obstacle_radius)])
+
+    fig, ax = plt.subplots(figsize=(COL_WIDTH, COL_WIDTH))
+    if obstacles is not None:
+        for ox, oy, r in obstacles:
+            ax.add_patch(plt.Circle((ox, oy), r, color=COLORS["grey"],
+                                    alpha=0.35, zorder=0))
+    if gates is not None:
+        ax.scatter(gates[:, 0], gates[:, 1], marker="s", s=45,
+                   facecolors="none", edgecolors="k", linewidths=1.0,
+                   label="gates", zorder=4)
+
+    # Colour the path by speed via a LineCollection.
+    pts = np.array([x, y]).T.reshape(-1, 1, 2)
+    segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+    lc = LineCollection(segs, cmap="viridis", zorder=2)
+    lc.set_array(speed[:-1])
+    lc.set_linewidth(1.8)
+    line = ax.add_collection(lc)
+    cbar = fig.colorbar(line, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("speed [m/s]")
+
+    # Mark start and gate-pass points.
+    ax.scatter(x[0], y[0], marker="o", s=25, color=COLORS["accent"],
+               zorder=5, label="start")
+    dt = float(traj.t.iloc[1] - traj.t.iloc[0]) or 1e-9
+    events = _stream(run_dir, "events")
+    if events is not None:
+        for _, row in events[events.event_type == "gate_passed"].iterrows():
+            idx = int(np.clip(round(row.t / dt), 0, len(x) - 1))
+            ax.scatter(x[idx], y[idx], marker="x", s=40,
+                       color=COLORS["baseline"], zorder=5)
+
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal")
+    ax.autoscale()
+    ax.legend(loc="best")
+    ax.set_title(f"Flown path coloured by speed ({speed_src})")
+    save(fig, out_dir, name)
+
+
 def plot_planner_runtime(results_dir: str, out_dir: str,
                          name: str = "planner_runtime") -> None:
     """Distribution of planner runtimes, split into initial vs. replan.
