@@ -89,6 +89,8 @@ def plot_track_speed_overlay(run_dir: str, out_dir: str,
                              obstacle_radius: float = 0.05,
                              obstacles: Optional[np.ndarray] = None,
                              gates: Optional[np.ndarray] = None,
+                             vmin: Optional[float] = None,
+                             vmax: Optional[float] = None,
                              name: str = "track_speed_overlay") -> None:
     """Top-down flown path, colour-coded by speed, over the track.
 
@@ -155,6 +157,8 @@ def plot_track_speed_overlay(run_dir: str, out_dir: str,
     lc = LineCollection(segs, cmap="viridis", zorder=2)
     lc.set_array(speed[:-1])
     lc.set_linewidth(1.8)
+    if vmin is not None or vmax is not None:
+        lc.set_clim(vmin, vmax)  # shared scale for comparing runs
     line = ax.add_collection(lc)
     cbar = fig.colorbar(line, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("speed [m/s]")
