@@ -3,9 +3,9 @@
 It builds minimum-time motion primitives, solves a sampled gate-crossing graph, and fits the
 result as an arc-length cubic spline for the MPCC controller.
 
-Based on the algorithms in "AlphaPilot: Autonomous Drone Racing", Foehn et al., Autonomous Robots
+Based on the algorithms in "AlphaPilot: Autonomous Drone Racing", Foehn, Autonomous Robots
 2021 (min-time primitives + sampled graph), and "Model Predictive Contouring Control for
-Time-Optimal Quadrotor Flight", Romero et al., IEEE T-RO 2022 (arc-length parameterization).
+Time-Optimal Quadrotor Flight", Romero, IEEE T-RO 2022 (arc-length parameterization).
 """
 
 from __future__ import annotations
@@ -564,9 +564,7 @@ class _GraphPlanner:
 
         Find the single fastest route through the graph, then collision-check only the primitives
         on that optimal route. If any of them clips an obstacle, return None so the caller drops to
-        the no-check straight-line fallback. The optimal path is used as-is and never patched
-        around obstacles by banning edges and re-solving; this matches the working smooth-replan
-        behaviour and avoids the contorted detour routes that the MPCC cannot track.
+        the no-check straight-line fallback.
         """
         t0 = time.perf_counter()
         nodes, adj, end_node = self._build_graph()
@@ -902,7 +900,7 @@ class PointMassPlanner:
         self._waypoints_pos = pos_uniform
         self._speed_profile = speed_uniform
 
-    # -- public API consumed by attitude_mpc.py for MPCC and logging ----------------------
+    # public API consumed by attitude_mpc.py for MPCC and logging
     @property
     def total_length(self) -> float:
         """Return the total arc length of the planned trajectory."""
