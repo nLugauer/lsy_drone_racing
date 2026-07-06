@@ -280,7 +280,7 @@ class AttitudeMPC(Controller):
                 obstacle_manager=self._obstacle_manager.snapshot(),
                 u_max=12.0,
                 v_max=v_max,
-                n_vel_samples=600, 
+                n_vel_samples=600,
                 tail_extension=tail_extension,
             )
         else:
@@ -326,22 +326,20 @@ class AttitudeMPC(Controller):
         self._last_u0 = np.array([0.0, 0.0, 0.0, self._last_thrust])  # QP-failure fallback
         self._needs_warm_start_reset = False
 
-        # Async PMM replanner: run the full PMM replan on a background thread so the control loop doesn't stall
+        # Async PMM replanner: run the replan off the control loop so it never stalls
         self._replanner = AsyncPMMReplanner() if self.USE_PMM_PLANNER else None
         # Replan counters (per episode) for logging/analysis.
         self._n_replan_triggered = 0  # reveals that requested a fresh plan
-        self._n_replan_adopted = 0    # finished plans actually swapped in
+        self._n_replan_adopted = 0  # finished plans actually swapped in
         # Backbone: the trajectory computed offline
         self._backbone = self._trajectory if self.USE_PMM_PLANNER else None
-        self._suffix_gap = 0.5  
+        self._suffix_gap = 0.5
         self._planned_gates_pos = gate_positions.copy()
         self._planned_target = 0
         self._replan_horizon = 3  # gates ahead of the target to replan through (paper Sec. VI-B)
         self._replan_vel_samples = 80
-        self._replan_gate_move = 0.12 
-        self._commit_distance = (
-            0.35 
-        )
+        self._replan_gate_move = 0.12
+        self._commit_distance = 0.35
         self._gate_approach_margin = 0.4
 
     def _stage_params(
@@ -483,9 +481,9 @@ class AttitudeMPC(Controller):
     ) -> None:
         """Correct the reference when revealed gates move, without stalling the control loop.
 
-        Once a gate in the replan window moves, re-plan through its real opening. Adopt a finished plan if
-        one is ready (guarding against reversing and stale plans) and, if a window gate moved past
-        threshold, requests a fresh one. The loop keeps flying the current plan meanwhile.
+        Once a gate in the replan window moves, re-plan through its real opening. Adopt a finished
+        plan if one is ready (guarding against reversing and stale plans) and, if a window gate
+        moved past threshold, request a fresh one. The loop keeps flying the current plan meanwhile.
         """
         target = int(obs.get("target_gate", 0))
 
@@ -571,7 +569,7 @@ class AttitudeMPC(Controller):
             start_pos = np.array(obs["pos"], dtype=np.float64)
             start_vel = np.array(obs["vel"], dtype=np.float64)
 
-        # Reuse the backbone to extend the plan beyond the horizon, if horizon is smaller than remaining gates
+        # Reuse the backbone past the horizon when it is shorter than the remaining gates
         committed_suffix_pts = committed_suffix_speeds = None
         if self._backbone is not None and window.stop < len(gates_pos):
             bb = self._backbone
@@ -585,13 +583,13 @@ class AttitudeMPC(Controller):
                 committed_suffix_pts = np.asarray(bb.evaluate(s_suf), dtype=np.float64)
                 committed_suffix_speeds = np.asarray(bb.evaluate_speed(s_suf), dtype=np.float64)
 
-        # Snapshot the obstacles on this thread 
+        # Snapshot the obstacles on this thread
         horizon_gates = np.array(gates_pos[window], dtype=np.float64)
         horizon_rpys = (
             np.array(gates_rpys[window], dtype=np.float64) if gates_rpys is not None else None
         )
         obs_snapshot = self._obstacle_manager.snapshot(exclude_gate_centers=horizon_gates)
-        planner = self._trajectory 
+        planner = self._trajectory
         self._replanner.request(
             lambda: planner._replan_local(
                 start_pos,
@@ -612,7 +610,8 @@ class AttitudeMPC(Controller):
     def _reanchor_progress(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Re-fit the progress state (theta, v_theta) onto the current trajectory after a swap.
 
-        Relocate theta to the nearest point on the new path and re-project the measured velocity onto its tangent.
+        Relocate theta to the nearest point on the new path and re-project the measured velocity
+        onto its tangent.
         """
         knot_start = self._trajectory.knot_points[0]
         knot_end = self._trajectory.knot_points[-1]
