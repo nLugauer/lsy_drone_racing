@@ -121,6 +121,22 @@ class SimRecorder:
             for i, ms in enumerate(self._control_ms):
                 log.record_solve(i * self.dt, ms)
 
+            # 2b) replan events, from the controller's per-episode counters. One
+            #     planner_stats row per triggered replan, so runs_summary's
+            #     n_replans reflects the true count (per-plan timing/geometry are
+            #     not exposed, hence NaN).
+            n_trig = int(getattr(controller, "_n_replan_triggered", 0) or 0)
+            n_adopt = int(getattr(controller, "_n_replan_adopted", 0) or 0)
+            horizon = int(getattr(controller, "_replan_horizon", -1) or -1)
+            nvs = int(getattr(controller, "_replan_vel_samples", -1) or -1)
+            for _ in range(n_trig):
+                log.record_plan(t_trigger=float("nan"), plan_time_ms=float("nan"),
+                                n_vel_samples=nvs, horizon=horizon,
+                                path_length=float("nan"), cost=float("nan"),
+                                is_replan=True)
+            if n_trig or n_adopt:
+                print(f"[analysis] replans: {n_trig} triggered, {n_adopt} adopted")
+
             # 3) trajectory (drone position + velocity over time).
             for (t, x, y, z, vx, vy, vz) in self._traj:
                 log.record_state(t, [x, y, z], [vx, vy, vz], s=float("nan"))

@@ -216,10 +216,10 @@ def create_ocp_solver(
 class AttitudeMPC(Controller):
     """MPCC controller using the collective-thrust and attitude interface."""
 
-    USE_PMM_PLANNER = False
+    USE_PMM_PLANNER = True
 
     # Online replanning: True -> replan the reference as gates are revealed; False -> OG track
-    PMM_REPLAN = False
+    PMM_REPLAN = True
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the controller.
@@ -269,12 +269,9 @@ class AttitudeMPC(Controller):
         start_pos = np.array(obs["pos"], dtype=np.float64)
 
         if self.USE_PMM_PLANNER:
-            # PMM racing line (Foehn et al. 2021, Sec. VI), refit as an arc-length cubic spline.
-            # v_max matches the MPCC v_theta cap; the tail past the last gate must cover the MPCC
-            # look-ahead so the reference does not pile up at the spline end. The snapshot gives the
-            # planner a frozen, thread-safe obstacle copy.
             v_max = 4.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
+            # Initialize the PMM planner
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
@@ -283,7 +280,7 @@ class AttitudeMPC(Controller):
                 obstacle_manager=self._obstacle_manager.snapshot(),
                 u_max=12.0,
                 v_max=v_max,
-                n_vel_samples=600,  # offline initial plan: more samples -> better global line
+                n_vel_samples=600, 
                 tail_extension=tail_extension,
             )
         else:
@@ -329,21 +326,23 @@ class AttitudeMPC(Controller):
         self._last_u0 = np.array([0.0, 0.0, 0.0, self._last_thrust])  # QP-failure fallback
         self._needs_warm_start_reset = False
 
-        # Asynchronous PMM replanning so the 50 Hz loop never stalls; the obstacle
-        # manager is updated every tick, so the MPCC constraints always use live positions.
+        # Async PMM replanner: run the full PMM replan on a background thread so the control loop doesn't stall
         self._replanner = AsyncPMMReplanner() if self.USE_PMM_PLANNER else None
-        # Offline backbone: the high-M global plan above
+        # Replan counters (per episode) for logging/analysis.
+        self._n_replan_triggered = 0  # reveals that requested a fresh plan
+        self._n_replan_adopted = 0    # finished plans actually swapped in
+        # Backbone: the trajectory computed offline
         self._backbone = self._trajectory if self.USE_PMM_PLANNER else None
-        self._suffix_gap = 0.5  # [m] start the backbone suffix this far past the last window gate
+        self._suffix_gap = 0.5  
         self._planned_gates_pos = gate_positions.copy()
         self._planned_target = 0
         self._replan_horizon = 3  # gates ahead of the target to replan through (paper Sec. VI-B)
         self._replan_vel_samples = 80
-        self._replan_gate_move = 0.12  # [m] observed gate shift that triggers a replan
+        self._replan_gate_move = 0.12 
         self._commit_distance = (
-            0.35  # [m] near-field kept fixed across a replan (no reference jump)
+            0.35 
         )
-        self._gate_approach_margin = 0.4  # [m] approach room left before the target gate on replan
+        self._gate_approach_margin = 0.4
 
     def _stage_params(
         self, theta: float, target_gate_idx: int, obs_params: NDArray[np.floating], n_params: int
@@ -377,7 +376,7 @@ class AttitudeMPC(Controller):
         # Replan when a gate's observed position changes
         if gates_pos is not None and self.PMM_REPLAN:
             if self.USE_PMM_PLANNER:
-                self._maybe_replan_pmm(
+                self._adopt_or_request_replan(
                     obs, gates_pos, gates_rpys if gates_yaw is not None else None
                 )
             elif "gates_visited" in obs:
@@ -428,8 +427,6 @@ class AttitudeMPC(Controller):
                 j, "p", self._stage_params(theta_pred, target_gate_idx, obs_params, total_params)
             )
 
-            # Steer v_theta toward the PMM's time-optimal speed (fast on straights, slower into
-            # turns), clipped to the v_theta bound. Legacy spline keeps the constant target.
             if self.USE_PMM_PLANNER:
                 yref_j = yref_target.copy()
                 yref_j[8] = float(
@@ -478,24 +475,23 @@ class AttitudeMPC(Controller):
         )
         return u0
 
-    def _maybe_replan_pmm(
+    def _adopt_or_request_replan(
         self,
         obs: dict[str, NDArray[np.floating]],
         gates_pos: NDArray[np.floating],
         gates_rpys: NDArray[np.floating] | None,
     ) -> None:
-        """Off-thread PMM replanning: adopt a finished background plan and/or start a new one.
+        """Correct the reference when revealed gates move, without stalling the control loop.
 
-        Each tick this swaps in a finished plan and, if a gate in the
-        replan window moved, requests a fresh plan on a worker thread. The
-        control loop keeps flying the current plan meanwhile.
+        Once a gate in the replan window moves, re-plan through its real opening. Adopt a finished plan if
+        one is ready (guarding against reversing and stale plans) and, if a window gate moved past
+        threshold, requests a fresh one. The loop keeps flying the current plan meanwhile.
         """
         target = int(obs.get("target_gate", 0))
 
-        # Adopt a finished plan only if its starting gate has not been passed since the request
         new_planner = self._replanner.take()
         if new_planner is not None and target == self._planned_target:
-            # Reject a reversing plan
+            # If start tangent opposes the velocity, discard it
             vel = np.array(obs["vel"], dtype=np.float64)
             speed = float(np.linalg.norm(vel))
             tang = np.asarray(
@@ -507,14 +503,16 @@ class AttitudeMPC(Controller):
                 old_theta = self._current_theta
                 self._trajectory = new_planner
                 self._reanchor_progress(obs)
-                # Keep the warm start and shift its theta
+                # Keep warm start
                 self._shift_warmstart_theta(self._current_theta - old_theta)
+                self._n_replan_adopted += 1
                 logger.info(
                     "REPLAN adopted: target=%d, len=%.2f m", target, self._trajectory.total_length
                 )
             else:
                 logger.warning("REPLAN discarded (reversing): target=%d", target)
         elif new_planner is not None:
+            # Drop stale plans
             logger.warning(
                 "REPLAN discarded (stale): built for %d, target %d", self._planned_target, target
             )
@@ -522,7 +520,7 @@ class AttitudeMPC(Controller):
         if target < 0:
             return  # final gate passed; nothing left to plan
 
-        # Trigger: a gate in the planning window moved beyond threshold.
+        # Trigger a replan only when a window gate has moved past threshold
         window = slice(target, min(target + self._replan_horizon, len(gates_pos)))
         moved = 0.0
         if window.stop > window.start:
@@ -535,6 +533,7 @@ class AttitudeMPC(Controller):
             return  # a replan is already running; re-checked next tick
 
         reason = f"gate_moved={moved:.3f}m"
+        self._n_replan_triggered += 1
         logger.info(
             "REPLAN trigger @%d: %s, target=%d, window=[%d:%d]",
             self._tick,
@@ -544,9 +543,8 @@ class AttitudeMPC(Controller):
             window.stop,
         )
 
-        # Start new plan a short look-ahead (commit_distance) ahead of
-        # the drone and prepend the segment in between, so the immediate reference is unchanged
-        # across adoption
+        # Begin the new plan commit_distance ahead of the drone and prepend the
+        # current path segment in between, to avoid jumps
         knots = self._trajectory.knot_points
         theta_now = float(np.clip(self._current_theta, knots[0], knots[-1]))
         theta_commit = min(theta_now + self._commit_distance, self._trajectory.total_length)
@@ -573,8 +571,7 @@ class AttitudeMPC(Controller):
             start_pos = np.array(obs["pos"], dtype=np.float64)
             start_vel = np.array(obs["vel"], dtype=np.float64)
 
-        # Far-field suffix: reuse the offline backbone beyond the replan window
-        # (if number of gates is smaller than total number of gates)
+        # Reuse the backbone to extend the plan beyond the horizon, if horizon is smaller than remaining gates
         committed_suffix_pts = committed_suffix_speeds = None
         if self._backbone is not None and window.stop < len(gates_pos):
             bb = self._backbone
@@ -588,16 +585,15 @@ class AttitudeMPC(Controller):
                 committed_suffix_pts = np.asarray(bb.evaluate(s_suf), dtype=np.float64)
                 committed_suffix_speeds = np.asarray(bb.evaluate_speed(s_suf), dtype=np.float64)
 
-        # Snapshots on this thread so the worker reads no shared mutable state. Exclude
-        # only the gates this replan routes through, so it can fly through their openings.
+        # Snapshot the obstacles on this thread 
         horizon_gates = np.array(gates_pos[window], dtype=np.float64)
         horizon_rpys = (
             np.array(gates_rpys[window], dtype=np.float64) if gates_rpys is not None else None
         )
         obs_snapshot = self._obstacle_manager.snapshot(exclude_gate_centers=horizon_gates)
-        planner = self._trajectory  # captured by the closure; _spawn reuses its tuning
+        planner = self._trajectory 
         self._replanner.request(
-            lambda: planner._spawn(
+            lambda: planner._replan_local(
                 start_pos,
                 horizon_gates,
                 horizon_rpys,
@@ -614,10 +610,9 @@ class AttitudeMPC(Controller):
         self._planned_target = target
 
     def _reanchor_progress(self, obs: dict[str, NDArray[np.floating]]) -> None:
-        """Re-fit (theta, v_theta) to the current trajectory after a swap.
+        """Re-fit the progress state (theta, v_theta) onto the current trajectory after a swap.
 
-        Searches only the first 3 m of the new path so the reference cannot snap to a future
-        segment where the path crosses over itself.
+        Relocate theta to the nearest point on the new path and re-project the measured velocity onto its tangent.
         """
         knot_start = self._trajectory.knot_points[0]
         knot_end = self._trajectory.knot_points[-1]
@@ -633,10 +628,10 @@ class AttitudeMPC(Controller):
         self._current_v_theta = max(0.01, v_proj)
 
     def _shift_warmstart_theta(self, delta: float) -> None:
-        """Add a constant progress offset to every warm-start stage's theta after a replan swap.
+        """Shift every warm-start stage's theta by a constant after a replan swap.
 
-        The near-field geometry is identical across the swap, so shifting only theta by
-        the same constant keeps the stored solution valid. No-op on the first tick.
+        Offsetting every stage's theta by that same delta keeps the stored solution valid,
+        so the solver warm-starts
         """
         if self._tick == 0:
             return
