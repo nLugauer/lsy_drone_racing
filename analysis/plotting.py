@@ -109,15 +109,18 @@ def plot_track_speed_overlay(run_dir: str, out_dir: str,
         warnings.warn("trajectory too short for speed overlay")
         return
     x, y = traj.x.to_numpy(), traj.y.to_numpy()
+    z = traj.z.to_numpy()
+    n = _cutoff_index(x, y, z)  # drop trailing teleport artifact
+    x, y, z = x[:n], y[:n], z[:n]
 
     # Speed: prefer logged velocity, else finite-difference the position.
     vcols = {"vx", "vy", "vz"}
     if vcols.issubset(traj.columns) and traj[list(vcols)].notna().any().any():
-        speed = np.sqrt(traj.vx ** 2 + traj.vy ** 2 + traj.vz ** 2).to_numpy()
+        speed = np.sqrt(traj.vx ** 2 + traj.vy ** 2
+                        + traj.vz ** 2).to_numpy()[:n]
         speed_src = "logged"
     else:
-        t = traj.t.to_numpy()
-        z = traj.z.to_numpy()
+        t = traj.t.to_numpy()[:n]
         speed = np.sqrt(np.gradient(x, t) ** 2 + np.gradient(y, t) ** 2
                         + np.gradient(z, t) ** 2)
         speed_src = "finite-diff"
@@ -173,6 +176,90 @@ def plot_track_speed_overlay(run_dir: str, out_dir: str,
     ax.autoscale()
     ax.legend(loc="best")
     ax.set_title(f"Flown path coloured by speed ({speed_src})")
+    save(fig, out_dir, name)
+
+
+def _cutoff_index(x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                  factor: float = 8.0, min_jump: float = 0.5) -> int:
+    """Index at which to truncate a trajectory to drop teleport artifacts.
+
+    On the terminating step the env may auto-reset and report a position that
+    jumps far from the flown path. Returns the number of leading points to
+    keep: everything up to the first step whose length exceeds
+    ``max(min_jump, factor * median step)``.
+    """
+    seg = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2 + np.diff(z) ** 2)
+    if len(seg) == 0:
+        return len(x)
+    pos = seg[seg > 0]
+    med = float(np.median(pos)) if len(pos) else 0.0
+    bad = np.where(seg > max(min_jump, factor * med))[0]
+    return int(bad[0] + 1) if len(bad) else len(x)
+
+
+def _run_speed(run_dir: str):
+    """Return (progress_pct, speed, t) for a run, or None.
+
+    Speed uses logged velocity if present, else finite-difference of position.
+    Progress is cumulative arc length along the flown path, in percent, so
+    runs of different duration/length can be overlaid on a common x-axis.
+    A trailing teleport artifact (gym auto-reset) is trimmed.
+    """
+    traj = _stream(run_dir, "trajectory")
+    if traj is None or len(traj) < 2:
+        return None
+    x, y, z = traj.x.to_numpy(), traj.y.to_numpy(), traj.z.to_numpy()
+    n = _cutoff_index(x, y, z)
+    x, y, z = x[:n], y[:n], z[:n]
+    tt = traj.t.to_numpy()[:n]
+    vcols = {"vx", "vy", "vz"}
+    if vcols.issubset(traj.columns) and traj[list(vcols)].notna().any().any():
+        speed = np.sqrt(traj.vx ** 2 + traj.vy ** 2
+                        + traj.vz ** 2).to_numpy()[:n]
+    else:
+        speed = np.sqrt(np.gradient(x, tt) ** 2 + np.gradient(y, tt) ** 2
+                        + np.gradient(z, tt) ** 2)
+    seg = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2 + np.diff(z) ** 2)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    progress = 100.0 * s / s[-1] if s[-1] > 0 else s
+    return progress, speed, tt
+
+
+def plot_speed_comparison(runs, out_dir: str, labels=None,
+                          x_axis: str = "progress",
+                          name: str = "speed_comparison") -> None:
+    """Overlay drone speed for several runs on a common axis.
+
+    ``runs``: list of run directories. ``labels``: matching names (defaults to
+    the folder names). ``x_axis``: "progress" (cumulative arc length, %, so
+    laps of different length align) or "time" (seconds). Line colour follows
+    the run label ("pmm" -> blue, "cubic"/"spline" -> orange).
+    """
+    apply_style()
+    if labels is None:
+        labels = [os.path.basename(os.path.normpath(r)) for r in runs]
+    fig, ax = plt.subplots(figsize=(DBL_WIDTH, COL_WIDTH * 0.75))
+    plotted = False
+    for run, label in zip(runs, labels):
+        res = _run_speed(run)
+        if res is None:
+            warnings.warn(f"no usable trajectory in {run}")
+            continue
+        progress, speed, t = res
+        xvals = t if x_axis == "time" else progress
+        low = label.lower()
+        color = (COLORS["pmm"] if "pmm" in low
+                 else COLORS["baseline"] if ("cubic" in low or "spline" in low)
+                 else None)
+        ax.plot(xvals, speed, color=color,
+                label=f"{label} (mean {np.mean(speed):.2f} m/s)")
+        plotted = True
+    if not plotted:
+        return
+    ax.set_xlabel("time [s]" if x_axis == "time" else "track progress [%]")
+    ax.set_ylabel("speed [m/s]")
+    ax.set_title("Drone speed comparison")
+    ax.legend(loc="best")
     save(fig, out_dir, name)
 
 

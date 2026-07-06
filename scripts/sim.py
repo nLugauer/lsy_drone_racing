@@ -107,7 +107,9 @@ def simulate(
             control_ms = (time.perf_counter() - t_ctrl) * 1e3
 
             obs, reward, terminated, truncated, info = env.step(action)
-            if recorder is not None:
+            # Skip the terminating step: the env auto-resets, so its obs
+            # reports a position jumped back toward start (a teleport artifact).
+            if recorder is not None and not (terminated or truncated):
                 recorder.record_tick(curr_time, obs, control_ms)
             # Update the controller internal state and models.
             controller_finished = controller.step_callback(
