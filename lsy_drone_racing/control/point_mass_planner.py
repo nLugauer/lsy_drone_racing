@@ -2,6 +2,10 @@
 
 It builds minimum-time motion primitives, solves a sampled gate-crossing graph, and fits the
 result as an arc-length cubic spline for the MPCC controller.
+
+Based on the algorithms in "AlphaPilot: Autonomous Drone Racing", Foehn et al., Autonomous Robots
+2021 (min-time primitives + sampled graph), and "Model Predictive Contouring Control for
+Time-Optimal Quadrotor Flight", Romero et al., IEEE T-RO 2022 (arc-length parameterization).
 """
 
 from __future__ import annotations
@@ -25,6 +29,173 @@ if TYPE_CHECKING:
 # Shared logger for the whole PMM stack (planner + the controller's replan trigger). Enable with
 # logging.getLogger("lsy_drone_racing.pmm").setLevel(logging.INFO).
 logger = logging.getLogger("lsy_drone_racing.pmm")
+
+
+class _Axis1D:
+    """Represent a one-axis acceleration profile as a list of (acceleration, duration) phases."""
+
+    def __init__(self, p0: float, v0: float, phases: list[tuple[float, float]]) -> None:
+        self.p0 = float(p0)
+        self.v0 = float(v0)
+        # Keep only non-zero-duration phases, stored as (acceleration, duration) tuples.
+        self.phases = [(float(a), float(dt)) for a, dt in phases if dt > 1e-12]
+        # Total duration is the sum of all phase durations.
+        self.Ttotal = float(sum(dt for _, dt in self.phases))
+
+    def state_at(self, t: float) -> tuple[float, float]:
+        """Return (position, velocity) at time t (clamped to [0, T])."""
+        t = float(np.clip(t, 0.0, self.Ttotal))
+        p, v = self.p0, self.v0
+        for a, dt in self.phases:
+            # Integrate only up to the requested time within this phase.
+            dt_step = min(t, dt)
+            # Constant-acceleration motion equations.
+            p += v * dt_step + 0.5 * a * dt_step * dt_step
+            v += a * dt_step
+            # Consume the time we just integrated.
+            t -= dt_step
+            if t <= 1e-12:
+                break
+        return p, v
+
+
+class _CubicAxis1D:
+    """Smooth one-axis trajectory stretched to a prescribed duration.
+
+    Used as a fallback for the faster ("slack") axes of a 3-axis primitive: it matches the desired
+    start and end positions and velocities while arriving exactly at T, so all three axes finish
+    simultaneously without introducing waiting segments. This is the cubic Hermite interpolant
+    written out in closed form (no scipy call needed for two boundary points).
+    """
+
+    def __init__(self, p0: float, v0: float, pf: float, vf: float, T: float) -> None:
+        self.p0, self.v0, self.Ttotal = float(p0), float(v0), float(T)
+        # Cubic Hermite coefficients: p(t) = p0 + v0 t + _c t^2 + _d t^3, chosen so p(T)=pf, p'(T)=vf.
+        P = pf - p0 - v0 * T
+        V = vf - v0
+        self._c = 3.0 * P / T**2 - V / T
+        self._d = V / T**2 - 2.0 * P / T**3
+
+    def state_at(self, t: float) -> tuple[float, float]:
+        """Return (position, velocity) at time t (clamped to [0, T])."""
+        t = float(np.clip(t, 0.0, self.Ttotal))
+        p = self.p0 + self.v0 * t + self._c * t * t + self._d * t**3
+        v = self.v0 + 2.0 * self._c * t + 3.0 * self._d * t * t
+        return p, v
+
+
+def _quad_roots(a: float, b: float, c: float) -> list[float]:
+    """Return the real roots of a*x^2 + b*x + c (handles the linear a≈0 case)."""
+    if abs(a) < 1e-12:
+        return [] if abs(b) < 1e-12 else [-c / b]
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return []
+    sq = np.sqrt(disc)
+    return [(-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)]
+
+
+def _two_phase_time(
+    p0: float, v0: float, pf: float, vf: float, a1: float, a2: float
+) -> tuple[float, float, float] | None:
+    """Return (T, t1, t2) of the 'accelerate at a1 then a2' bang-bang reaching (pf, vf), or None.
+
+    Writing t2 in terms of t1 turns the position constraint into A*t1^2 + B*t1 + C = dp; the
+    smallest non-negative (t1, t2) pair is the fastest solution of this acceleration ordering.
+    """
+    dp = pf - p0
+    A = a1 * (a2 - a1) / (2.0 * a2)
+    B = v0 * (a2 - a1) / a2
+    C = (vf * vf - v0 * v0) / (2.0 * a2)
+
+    best = None
+    for t1 in _quad_roots(A, B, C - dp):
+        # Skip clearly negative roots; clamp tiny numerical negatives to zero.
+        if t1 < -1e-9:
+            continue
+        t1 = max(t1, 0.0)
+        t2 = (vf - v0 - a1 * t1) / a2
+        if t2 < -1e-9:
+            continue
+        t2 = max(t2, 0.0)
+        T = t1 + t2
+        if best is None or T < best[0]:
+            best = (T, t1, t2)
+    return best
+
+
+def min_time_1d(
+    p0: float, v0: float, pf: float, vf: float, u_lo: float, u_hi: float, v_cap: float | None = None
+) -> _Axis1D:
+    """Return the minimum-time 1-D profile: bang-bang, or bang-singular-bang under a speed cap."""
+    best, best_a = None, None
+    # Try both acceleration orderings and keep the faster feasible one.
+    for a1, a2 in ((u_hi, u_lo), (u_lo, u_hi)):
+        sol = _two_phase_time(p0, v0, pf, vf, a1, a2)
+        if sol is not None and (best is None or sol[0] < best[0]):
+            best, best_a = sol, (a1, a2)
+
+    if best is None:  # no feasible bang-bang (should not happen for finite bounds); hold position
+        return _Axis1D(p0, v0, [(0.0, 0.0)])
+
+    T, t1, t2 = best
+    a1, a2 = best_a
+    # If the peak speed would exceed the cap, cruise at the cap instead (v_cap=None disables it).
+    if v_cap is not None and abs(v0 + a1 * t1) > v_cap + 1e-9:
+        cap = min_time_1d_capped(p0, v0, pf, vf, u_lo, u_hi, np.sign(v0 + a1 * t1) * v_cap)
+        if cap is not None:
+            return cap
+    return _Axis1D(p0, v0, [(a1, t1), (a2, t2)])
+
+
+def min_time_1d_capped(
+    p0: float, v0: float, pf: float, vf: float, u_lo: float, u_hi: float, v_sat: float
+) -> _Axis1D | None:
+    """Accelerate to v_sat, cruise, then brake to vf; return the profile (None if it will not fit).
+
+    Bang-singular-bang under a speed cap.
+    """
+    a_acc = u_hi if v_sat >= v0 else u_lo
+    a_dec = u_hi if vf >= v_sat else u_lo
+    if abs(a_acc) < 1e-12 or abs(a_dec) < 1e-12 or abs(v_sat) < 1e-12:
+        return None
+
+    # Times to reach v_sat and then vf, and the distances covered while (de)accelerating.
+    t1 = (v_sat - v0) / a_acc
+    t3 = (vf - v_sat) / a_dec
+    d1 = (v_sat * v_sat - v0 * v0) / (2.0 * a_acc)
+    d3 = (vf * vf - v_sat * v_sat) / (2.0 * a_dec)
+    # Remaining distance is cruised at the saturation speed.
+    t2 = ((pf - p0) - d1 - d3) / v_sat
+    if t1 < -1e-9 or t2 < -1e-9 or t3 < -1e-9:
+        return None  # cruise not feasible -> caller falls back to bang-bang
+    return _Axis1D(p0, v0, [(a_acc, max(t1, 0.0)), (0.0, max(t2, 0.0)), (a_dec, max(t3, 0.0))])
+
+
+def fixed_time_1d(
+    p0: float,
+    v0: float,
+    pf: float,
+    vf: float,
+    u_lo: float,
+    u_hi: float,
+    T_target: float,
+    v_cap: float | None = None,
+) -> _Axis1D | _CubicAxis1D:
+    """Return a 1-D profile that reaches (pf, vf) in exactly T_target.
+
+    In a 3-axis primitive the slowest axis sets the total time T*; the faster ("slack") axes are
+    stretched to T* so all three finish together.
+    """
+    # A stationary axis (no move, zero endpoint velocities) just holds for the whole duration.
+    if abs(pf - p0) < 1e-9 and abs(v0) < 1e-9 and abs(vf) < 1e-9:
+        return _Axis1D(p0, 0.0, [(0.0, T_target)])
+    # Take the time-optimal solution if it already fills T_target...
+    full = min_time_1d(p0, v0, pf, vf, u_lo, u_hi, v_cap)
+    if full.Ttotal >= T_target - 1e-6:
+        return full
+    # ...otherwise stretch the motion to T_target with a cubic Hermite.
+    return _CubicAxis1D(p0, v0, pf, vf, T_target)
 
 
 def _jax_edge_cost_base(
@@ -94,6 +265,8 @@ def _jax_edge_cost_base(
     return jnp.max(jax.vmap(_solve_axis)(dp, v0, vf, u_max, v_cap))
 
 
+# JIT-compiled and double-vmapped over layer-A (axis 0) x layer-B (axis 0): scores every candidate
+# edge (~10^5 per plan) in one batched call. u_max/v_cap are held per-axis (3,).
 _jax_edge_cost = jax.jit(
     jax.vmap(
         jax.vmap(_jax_edge_cost_base, in_axes=(None, None, 0, 0, None, None)),
@@ -102,144 +275,11 @@ _jax_edge_cost = jax.jit(
 )
 
 
-class _Axis1D:
-    """Return a one-dimensional acceleration profile."""
-
-    def __init__(self, p0: float, v0: float, phases: list[tuple[float, float]]) -> None:
-        self.p0 = float(p0)
-        self.v0 = float(v0)
-        self.phases = [(float(a), float(dt)) for a, dt in phases if dt > 1e-12]
-        self.T = float(sum(dt for _, dt in self.phases))
-
-    def state_at(self, t: float) -> tuple[float, float]:
-        """Return (position, velocity) at time t (clamped to [0, T])."""
-        t = float(np.clip(t, 0.0, self.T))
-        p, v = self.p0, self.v0
-        for a, dt in self.phases:
-            step = min(t, dt)
-            p += v * step + 0.5 * a * step * step
-            v += a * step
-            t -= step
-            if t <= 1e-12:
-                break
-        return p, v
-
-
-class _CubicAxis1D:
-    """Return a one-dimensional cubic profile used as a fallback for slack axes."""
-
-    def __init__(self, p0: float, v0: float, pf: float, vf: float, T: float) -> None:
-        self.p0, self.v0, self.T = float(p0), float(v0), float(T)
-        P = pf - p0 - v0 * T
-        V = vf - v0
-        self._c = 3.0 * P / T**2 - V / T
-        self._d = V / T**2 - 2.0 * P / T**3
-
-    def state_at(self, t: float) -> tuple[float, float]:
-        """Return (position, velocity) at time t (clamped to [0, T])."""
-        t = float(np.clip(t, 0.0, self.T))
-        p = self.p0 + self.v0 * t + self._c * t * t + self._d * t**3
-        v = self.v0 + 2.0 * self._c * t + 3.0 * self._d * t * t
-        return p, v
-
-
-def _quad_roots(a: float, b: float, c: float) -> list[float]:
-    """Return the real roots of a quadratic polynomial."""
-    if abs(a) < 1e-12:
-        return [] if abs(b) < 1e-12 else [-c / b]
-    disc = b * b - 4.0 * a * c
-    if disc < 0.0:
-        return []
-    sq = np.sqrt(disc)
-    return [(-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)]
-
-
-def _two_phase_time(
-    p0: float, v0: float, pf: float, vf: float, a1: float, a2: float
-) -> tuple[float, float, float] | None:
-    """Return the two-phase profile for one axis."""
-    dp = pf - p0
-    A = a1 * (a2 - a1) / (2.0 * a2)
-    B = v0 * (a2 - a1) / a2
-    C = (vf * vf - v0 * v0) / (2.0 * a2)
-
-    best = None
-    for t1 in _quad_roots(A, B, C - dp):
-        if t1 < -1e-9:
-            continue
-        t1 = max(t1, 0.0)
-        t2 = (vf - v0 - a1 * t1) / a2
-        if t2 < -1e-9:
-            continue
-        t2 = max(t2, 0.0)
-        T = t1 + t2
-        if best is None or T < best[0]:
-            best = (T, t1, t2)
-    return best
-
-
-def min_time_1d(
-    p0: float, v0: float, pf: float, vf: float, u_lo: float, u_hi: float, v_cap: float | None = None
-) -> _Axis1D:
-    """Return the minimum-time profile for one axis."""
-    best, best_a = None, None
-    for a1, a2 in ((u_hi, u_lo), (u_lo, u_hi)):
-        sol = _two_phase_time(p0, v0, pf, vf, a1, a2)
-        if sol is not None and (best is None or sol[0] < best[0]):
-            best, best_a = sol, (a1, a2)
-
-    if best is None:  # no feasible bang-bang (should not happen for finite bounds); hold position
-        return _Axis1D(p0, v0, [(0.0, 0.0)])
-
-    T, t1, t2 = best
-    a1, a2 = best_a
-    if v_cap is not None and abs(v0 + a1 * t1) > v_cap + 1e-9:
-        cap = min_time_1d_capped(p0, v0, pf, vf, u_lo, u_hi, np.sign(v0 + a1 * t1) * v_cap)
-        if cap is not None:
-            return cap
-    return _Axis1D(p0, v0, [(a1, t1), (a2, t2)])
-
-
-def min_time_1d_capped(
-    p0: float, v0: float, pf: float, vf: float, u_lo: float, u_hi: float, v_sat: float
-) -> _Axis1D | None:
-    """Return a capped minimum-time profile for one axis."""
-    a_acc = u_hi if v_sat >= v0 else u_lo
-    a_dec = u_hi if vf >= v_sat else u_lo
-    if abs(a_acc) < 1e-12 or abs(a_dec) < 1e-12 or abs(v_sat) < 1e-12:
-        return None
-
-    t1 = (v_sat - v0) / a_acc
-    t3 = (vf - v_sat) / a_dec
-    d1 = (v_sat * v_sat - v0 * v0) / (2.0 * a_acc)
-    d3 = (vf * vf - v_sat * v_sat) / (2.0 * a_dec)
-    t2 = ((pf - p0) - d1 - d3) / v_sat
-    if t1 < -1e-9 or t2 < -1e-9 or t3 < -1e-9:
-        return None  # cruise not feasible -> caller falls back to bang-bang
-    return _Axis1D(p0, v0, [(a_acc, max(t1, 0.0)), (0.0, max(t2, 0.0)), (a_dec, max(t3, 0.0))])
-
-
-def fixed_time_1d(
-    p0: float,
-    v0: float,
-    pf: float,
-    vf: float,
-    u_lo: float,
-    u_hi: float,
-    T_target: float,
-    v_cap: float | None = None,
-) -> _Axis1D | _CubicAxis1D:
-    """Return a profile that reaches the target state in the requested time."""
-    if abs(pf - p0) < 1e-9 and abs(v0) < 1e-9 and abs(vf) < 1e-9:
-        return _Axis1D(p0, 0.0, [(0.0, T_target)])
-    full = min_time_1d(p0, v0, pf, vf, u_lo, u_hi, v_cap)
-    if full.T >= T_target - 1e-6:
-        return full
-    return _CubicAxis1D(p0, v0, pf, vf, T_target)
-
-
 class MotionPrimitive:
-    """Represent a time-optimal primitive between two point-mass states."""
+    """Represent a feasible time-optimal 3D motion between two point-mass states.
+
+    Combines the per-axis time-optimal control profiles into a single synchronized trajectory.
+    """
 
     def __init__(
         self,
@@ -251,6 +291,7 @@ class MotionPrimitive:
         v_max: np.ndarray | None = None,
     ) -> None:
         """Initialize the primitive from the given boundary states."""
+        # Convert all inputs to float64 arrays.
         p0 = np.asarray(p0, dtype=np.float64)
         v0 = np.asarray(v0, dtype=np.float64)
         pf = np.asarray(pf, dtype=np.float64)
@@ -265,12 +306,15 @@ class MotionPrimitive:
             )
             for k in range(3)
         ]
-        self.T = max(ax.T for ax in full)
+        # Slowest axis sets the primitive duration.
+        self.Ttotal = max(ax.Ttotal for ax in full)
         self.axes: list[_Axis1D | _CubicAxis1D] = []
         self.n_cubic = 0  # non-critical axes stretched to T* with a cubic Hermite
         for k in range(3):
-            if full[k].T >= self.T - 1e-9:
+            # If the axis already fills T*, keep its time-optimal profile...
+            if full[k].Ttotal >= self.Ttotal - 1e-9:
                 self.axes.append(full[k])
+            # ...otherwise stretch it to T*.
             else:
                 ax = fixed_time_1d(
                     p0[k],
@@ -279,7 +323,7 @@ class MotionPrimitive:
                     vf[k],
                     -u_max[k],
                     u_max[k],
-                    self.T,
+                    self.Ttotal,
                     None if v_cap is None else v_cap[k],
                 )
                 self.axes.append(ax)
@@ -291,14 +335,18 @@ class MotionPrimitive:
         return np.array([p for p, _ in pv]), np.array([v for _, v in pv])
 
     def sample_positions(self, n: int) -> np.ndarray:
-        """Sample positions uniformly over the primitive duration."""
-        return np.array([self.state_at(t)[0] for t in np.linspace(0.0, self.T, max(n, 2))])
+        """Sample positions along the primitive (used for collision checks)."""
+        return np.array([self.state_at(t)[0] for t in np.linspace(0.0, self.Ttotal, max(n, 2))])
 
 
 def _cone_directions(
     rng: np.random.Generator, axis: np.ndarray, half_angle: float, n: int
 ) -> np.ndarray:
-    """Sample unit vectors around the given axis."""
+    """Sample unit vectors within a cone around the axis.
+
+    Used to generate multiple feasible gate-approach directions for the graph search.
+    """
+    # Normalize the cone axis and build an orthonormal frame around it.
     axis = axis / (np.linalg.norm(axis) + 1e-12)
     ref = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
     e1 = np.cross(axis, ref)
@@ -316,7 +364,13 @@ def _cone_directions(
 
 
 class _GraphPlanner:
-    """Solve a layered graph of sampled gate-crossing states."""
+    """Find the fastest sequence of gate-crossing states using a layered graph.
+
+    Each gate is represented by multiple sampled position/velocity states. Edges correspond to
+    feasible minimum-time motion primitives, and Dijkstra's algorithm selects the fastest path
+    through all graph layers. Compared to the original AlphaPilot approach, this implementation
+    also adds exit layers behind each gate and a penalty for sharp velocity turns.
+    """
 
     def __init__(
         self,
@@ -337,8 +391,21 @@ class _GraphPlanner:
         turn_penalty_weight: float = 0.3,
         max_turn_angle: float = np.pi,
     ) -> None:
+        """Initialize the graph planner and sample the gate-crossing layers.
+
+        The non self-explanatory parameters are:
+        n_samples: number of candidate states sampled per gate; phi_max: half-angle of the sampling
+        cone around each gate normal; speed_lo_frac: minimum sampled speed as a fraction of
+        ``v_max``; obstacle_manager: obstacle manager used for collision checking; n_collision_pts:
+        number of points sampled when checking a primitive for collisions; seed: random seed for
+        reproducible gate-state sampling; collision_margin: safety margin added around obstacles
+        during collision checking; gate_exit_dist: distance beyond each gate for the exit-state
+        layers; turn_penalty_weight: weight of the turn-angle penalty in edge costs; max_turn_angle:
+        hard cap on the per-edge turn angle; edges whose entry or exit bend exceeds it are rejected
+        outright (default pi = no rejection).
+        """
         self.u_max = u_max
-        self.v_axis_cap = np.full(3, float(v_max))
+        self.velocity_limits = np.full(3, float(v_max))
         self.obs = obstacle_manager
         self.n_collision_pts = n_collision_pts
         self.collision_margin = float(collision_margin)
@@ -347,20 +414,22 @@ class _GraphPlanner:
         self.stats: dict = {}
         rng = np.random.default_rng(seed)
 
-        v_mag = float(v_max)
-        speed_lo = speed_lo_frac * v_mag
+        max_speed = float(v_max)
+        min_speed = speed_lo_frac * max_speed
 
-        # Build the start layer and one crossing layer per gate.
-        self.layers: list[list[dict]] = [
-            [{"pos": np.asarray(start_pos, float), "vel": np.asarray(start_vel, float)}]
-        ]
+        # Layer 0 is the start state; then one crossing layer (plus optional exit layer) per gate.
+        start_state = {"pos": np.asarray(start_pos, float), "vel": np.asarray(start_vel, float)}
+        self.layers: list[list[dict]] = [[start_state]]
         for c, nrm in zip(gate_centers, gate_normals):
-            states = [{"pos": c.copy(), "vel": nrm * (0.5 * (speed_lo + v_mag))}]
+            # First sample crosses straight along the gate normal at mid speed.
+            states = [{"pos": c.copy(), "vel": nrm * (0.5 * (min_speed + max_speed))}]
+            # Additional samples fan out within a cone around the normal, at random speeds.
             if n_samples > 1:
                 dirs = _cone_directions(rng, nrm, phi_max, n_samples - 1)
-                speeds = rng.uniform(speed_lo, v_mag, n_samples - 1)
+                speeds = rng.uniform(min_speed, max_speed, n_samples - 1)
                 states += [{"pos": c.copy(), "vel": d * s} for d, s in zip(dirs, speeds)]
             self.layers.append(states)
+            # Exit layer just past the gate, so a straight crossing is forced and the gate counts.
             if gate_exit_dist > 0.0:
                 self.layers.append(
                     [
@@ -388,103 +457,143 @@ class _GraphPlanner:
         """Return True when the primitive stays clear of obstacles."""
         if self.obs is None:
             return True
+        # Sample points along the primitive and test them against the obstacle set.
         pts = prim.sample_positions(self.n_collision_pts)
         return not bool(self.obs.points_in_obstacles(pts, margin=self.collision_margin).any())
 
-    def solve(self) -> list[MotionPrimitive] | None:
-        """Return the minimum-time primitive chain through the gates."""
+    def _build_graph(self) -> tuple[list[dict], list[list[tuple[int, float]]], int]:
+        """Flatten the layered states into a single node list and directed adjacency list."""
+        # Flatten the layered graph into one node list; node_ids maps each (layer, local index) to
+        # a unique node ID.
         node_ids: dict[tuple[int, int], int] = {}
         nodes: list[dict] = []
-        for li, layer in enumerate(self.layers):
-            for ni, st in enumerate(layer):
-                node_ids[(li, ni)] = len(nodes)
-                nodes.append(st)
-        sink = len(nodes)
+        for lay_idx, layer in enumerate(self.layers):
+            for node_idx, state in enumerate(layer):
+                node_ids[(lay_idx, node_idx)] = len(nodes)
+                nodes.append(state)
+        # A virtual end node after the final layer gives Dijkstra a single goal.
+        end_node = len(nodes)
 
-        adj: list[list[tuple[int, float]]] = [[] for _ in range(sink + 1)]
-        u_max_jnp = jnp.array(self.u_max)
-        v_cap_jnp = jnp.array(self.v_axis_cap)
+        adj: list[list[tuple[int, float]]] = [[] for _ in range(end_node + 1)]
 
-        for li in range(len(self.layers) - 1):
-            layer_A, layer_B = self.layers[li], self.layers[li + 1]
-            pA = np.asarray([a["pos"] for a in layer_A], dtype=np.float64)
-            pB = np.asarray([b["pos"] for b in layer_B], dtype=np.float64)
-            vA = np.asarray([a["vel"] for a in layer_A], dtype=np.float64)
-            vB = np.asarray([b["vel"] for b in layer_B], dtype=np.float64)
+        for lay_idx in range(len(self.layers) - 1):
+            layer_A, layer_B = self.layers[lay_idx], self.layers[lay_idx + 1]
+            positions_A = np.asarray([s["pos"] for s in layer_A], dtype=np.float64)
+            velocities_A = np.asarray([s["vel"] for s in layer_A], dtype=np.float64)
+            positions_B = np.asarray([s["pos"] for s in layer_B], dtype=np.float64)
+            velocities_B = np.asarray([s["vel"] for s in layer_B], dtype=np.float64)
 
-            # Batched min-time cost on the GPU, transferred to CPU once.
+            # All edge costs of this layer pair in one batched, JIT-compiled jax call, transferred
+            # back to numpy once as a (KA, KB) matrix.
             cost = np.array(
                 _jax_edge_cost(
-                    jnp.array(pA), jnp.array(vA), jnp.array(pB), jnp.array(vB), u_max_jnp, v_cap_jnp
+                    jnp.array(positions_A),
+                    jnp.array(velocities_A),
+                    jnp.array(positions_B),
+                    jnp.array(velocities_B),
+                    jnp.array(self.u_max),
+                    jnp.array(self.velocity_limits),
                 )
             )
 
-            # Improvement 2b: penalize edges whose endpoint velocities deviate from the straight
-            # chord pA->pB (sharp turns the real quadrotor tracks poorly), and hard-reject bends
-            # beyond max_turn_angle. Straight center->exit edges deviate ~0 and stay unpenalized.
-            uA = vA / (np.linalg.norm(vA, axis=1, keepdims=True) + 1e-9)
-            uB = vB / (np.linalg.norm(vB, axis=1, keepdims=True) + 1e-9)
-            chord = pB[None, :, :] - pA[:, None, :]
-            chord = chord / (np.linalg.norm(chord, axis=2, keepdims=True) + 1e-9)
-            ang_in = np.arccos(np.clip(np.einsum("ad,abd->ab", uA, chord), -1.0, 1.0))
-            ang_out = np.arccos(np.clip(np.einsum("bd,abd->ab", uB, chord), -1.0, 1.0))
+            # Penalize edges whose endpoint velocities deviate from the straight chord A->B (sharp
+            # turns the real quadrotor tracks poorly), and hard-reject bends beyond max_turn_angle.
+            # Straight center->exit edges deviate ~0 and stay unpenalized.
+            uA = velocities_A / (np.linalg.norm(velocities_A, axis=1, keepdims=True) + 1e-9)
+            uB = velocities_B / (np.linalg.norm(velocities_B, axis=1, keepdims=True) + 1e-9)
+            path_direction = positions_B[None, :, :] - positions_A[:, None, :]
+            path_direction = path_direction / (
+                np.linalg.norm(path_direction, axis=2, keepdims=True) + 1e-9
+            )
+            ang_in = np.arccos(np.clip(np.einsum("ad,abd->ab", uA, path_direction), -1.0, 1.0))
+            ang_out = np.arccos(np.clip(np.einsum("bd,abd->ab", uB, path_direction), -1.0, 1.0))
             cost = cost + self.turn_penalty_weight * (ang_in**2 + ang_out**2)
             cost[np.maximum(ang_in, ang_out) > self.max_turn_angle] = np.inf
 
-            for ai in range(len(layer_A)):
-                ua = node_ids[(li, ai)]
-                for bi in range(len(layer_B)):
-                    T_star = float(cost[ai, bi])
-                    if np.isfinite(T_star):
-                        adj[ua].append((node_ids[(li + 1, bi)], T_star))
+            # Build the adjacency list, skipping infeasible (infinite-cost) edges.
+            for a_idx in range(len(layer_A)):
+                ua = node_ids[(lay_idx, a_idx)]
+                for b_idx in range(len(layer_B)):
+                    edge_cost = float(cost[a_idx, b_idx])
+                    if np.isfinite(edge_cost):
+                        adj[ua].append((node_ids[(lay_idx + 1, b_idx)], edge_cost))
 
+        # Connect every node in the last layer to the virtual end node with a zero-cost edge.
         last = len(self.layers) - 1
-        for ni in range(len(self.layers[last])):
-            adj[node_ids[(last, ni)]].append((sink, 0.0))
+        for node_idx in range(len(self.layers[last])):
+            adj[node_ids[(last, node_idx)]].append((end_node, 0.0))
 
-        dist = [np.inf] * (sink + 1)
-        prev: list[int | None] = [None] * (sink + 1)
-        dist[0] = 0.0
+        return nodes, adj, end_node
+
+    def _dijkstra(
+        self, adj: list[list[tuple[int, float]]], end_node: int
+    ) -> tuple[list[int] | None, float]:
+        """Return the shortest path (node list) from node 0 to end_node and its cost, or None."""
+        best_cost = [np.inf] * (end_node + 1)
+        prev: list[int | None] = [None] * (end_node + 1)
+        best_cost[0] = 0.0
         pq = [(0.0, 0)]
         while pq:
-            d, u = heapq.heappop(pq)
-            if d > dist[u] + 1e-12:
+            cur_cost, cur_node = heapq.heappop(pq)
+            # Ignore stale queue entries.
+            if cur_cost > best_cost[cur_node] + 1e-12:
                 continue
-            if u == sink:
+            if cur_node == end_node:
                 break
-            for v, w in adj[u]:
-                nd = d + w
-                if nd < dist[v] - 1e-12:
-                    dist[v] = nd
-                    prev[v] = u
-                    heapq.heappush(pq, (nd, v))
+            for next_node, edge_cost in adj[cur_node]:
+                nd = cur_cost + edge_cost
+                if nd < best_cost[next_node] - 1e-12:
+                    best_cost[next_node] = nd
+                    prev[next_node] = cur_node
+                    heapq.heappush(pq, (nd, next_node))
 
-        if not np.isfinite(dist[sink]):
-            return None
-        self.stats = {"cost": float(dist[sink])}
+        if not np.isfinite(best_cost[end_node]):
+            return None, np.inf
 
-        # Reconstruct the best route and check only its primitives.
-        path_nodes = []
-        cur = prev[sink]
+        # Reconstruct the route (the virtual end_node itself is left out).
+        path_nodes: list[int] = []
+        cur = prev[end_node]
         while cur is not None:
             path_nodes.append(cur)
             cur = prev[cur]
         path_nodes.reverse()
+        return path_nodes, float(best_cost[end_node])
 
+    def solve(self) -> list[MotionPrimitive] | None:
+        """Return the minimum-time primitive chain through the gates, or None if infeasible.
+
+        Find the single fastest route through the graph, then collision-check only the primitives
+        on that optimal route. If any of them clips an obstacle, return None so the caller drops to
+        the no-check straight-line fallback. The optimal path is used as-is and never patched
+        around obstacles by banning edges and re-solving; this matches the working smooth-replan
+        behaviour and avoids the contorted detour routes that the MPCC cannot track.
+        """
+        t0 = time.perf_counter()
+        nodes, adj, end_node = self._build_graph()
+
+        path_nodes, cost = self._dijkstra(adj, end_node)
+        if path_nodes is None:
+            logger.debug("graph: infeasible, %.1f ms", 1e3 * (time.perf_counter() - t0))
+            return None
+        self.stats = {"cost": cost}
+
+        # Reconstruct the best route and collision-check only its primitives.
         prims: list[MotionPrimitive] = []
         for i in range(len(path_nodes) - 1):
             a, b = nodes[path_nodes[i]], nodes[path_nodes[i + 1]]
             prim = MotionPrimitive(
-                a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.v_axis_cap
+                a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.velocity_limits
             )
             if not self._edge_ok(prim):
                 return None  # optimal path clips an obstacle -> trigger fallback
             prims.append(prim)
+
+        logger.debug("graph: solved, cost=%.3f s, %.1f ms", cost, 1e3 * (time.perf_counter() - t0))
         return prims
 
 
 def _as_f64(a: np.ndarray | None, cols: int) -> np.ndarray | None:
-    """Return an array as float64 with the requested shape."""
+    """Return an array as float64 with the requested shape (flat for cols=1, else (-1, cols))."""
     if a is None:
         return None
     a = np.asarray(a, dtype=np.float64)
@@ -492,7 +601,7 @@ def _as_f64(a: np.ndarray | None, cols: int) -> np.ndarray | None:
 
 
 class PointMassPlanner:
-    """Expose the PMM planner through the trajectory-planner interface."""
+    """Expose the PMM planner through the trajectory-planner interface for use with toggle."""
 
     def __init__(
         self,
@@ -521,7 +630,24 @@ class PointMassPlanner:
         committed_suffix_pts: np.ndarray | None = None,
         committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
-        """Initialize the planner and run the first plan."""
+        """Initialize the planner and run the first plan.
+
+        The non self-explanatory parameters are:
+        n_path_samples_per_seg: samples per primitive used for spline reconstruction;
+        n_collision_pts: number of points sampled per primitive for collision checking;
+        collision_margin: obstacle inflation margin for graph-level collision checking;
+        min_z: minimum allowed altitude in the final trajectory;
+        tail_extension: extension beyond the final waypoint to avoid MPCC horizon cutoff;
+        seed: random seed for reproducible graph sampling;
+        gate_exit_dist: offset behind each gate forcing a straight crossing so the gate counts;
+        turn_penalty_weight: cost weight for angular deviation in graph edges;
+        max_turn_angle: hard cap on the turn angle at either end of an edge; edges bending more
+        than this are rejected outright (default pi = no rejection, only the soft turn penalty);
+        committed_pts: previously executed trajectory points for replanning continuity;
+        committed_speeds: speeds corresponding to committed trajectory points;
+        committed_suffix_pts: fixed trajectory suffix appended after the optimized segment;
+        committed_suffix_speeds: speeds for the committed suffix segment.
+        """
         self._u_max = np.full(3, float(u_max)) if np.isscalar(u_max) else np.asarray(u_max, float)
         # v_max is a scalar SPEED (velocity norm), used both as the per-axis primitive cap and the
         # largest gate-crossing speed sampled, kept consistent with the MPCC's v_theta bound.
@@ -584,7 +710,8 @@ class PointMassPlanner:
         committed_suffix_pts: np.ndarray | None = None,
         committed_suffix_speeds: np.ndarray | None = None,
     ) -> None:
-        """Build a new path and fit it as an arc-length spline."""
+        """Run the graph planner and fit the result as a smooth arc-length spline."""
+        # Store the committed prefix/suffix used for replanning continuity.
         self._committed_pts = _as_f64(committed_pts, 3)
         self._committed_speeds = _as_f64(committed_speeds, 1)
         self._committed_suffix_pts = _as_f64(committed_suffix_pts, 3)
@@ -592,8 +719,10 @@ class PointMassPlanner:
         start_pos = np.asarray(start_pos, dtype=np.float64)
         gates_pos = np.asarray(gates_pos, dtype=np.float64).reshape(-1, 3)
 
+        # Build the gate structure: centers and required crossing directions.
         centers = [gates_pos[i] for i in range(len(gates_pos))]
         normals = self._gate_normals(start_pos, centers, gate_rpys)
+        # Initialize the start velocity (on the first plan it is effectively 0).
         if start_vel is None or float(np.linalg.norm(start_vel)) < 1e-6:
             d0 = (centers[0] - start_pos) if centers else np.array([1.0, 0.0, 0.0])
             start_vel = d0 / (np.linalg.norm(d0) + 1e-9) * (self._speed_lo_frac * self._v_max)
@@ -605,6 +734,7 @@ class PointMassPlanner:
             "plan START: gates=%d, M=%d, prefix=%s", len(centers), self._n_vel_samples, has_prefix
         )
 
+        # Run the graph planner with obstacle pruning.
         prims, stats = self._run_graph(start_pos, start_vel, centers, normals, prune=True)
         used_fallback = prims is None
         if used_fallback:
@@ -618,6 +748,7 @@ class PointMassPlanner:
                 start_pos, start_vel, centers, normals, prune=False, single=True
             )
 
+        # Turn the primitives into a smooth arc-length spline for the MPCC to track.
         self._build_spline_from_primitives(prims, normals[-1] if normals else None)
         logger.info(
             "plan DONE: %.1f ms, prims=%d, len=%.2f m, cost=%.3f s, fallback=%s",
@@ -636,9 +767,11 @@ class PointMassPlanner:
         prev = start_pos
         for i, c in enumerate(centers):
             if gate_rpys is not None:
+                # Use the gate yaw to define its facing direction.
                 yaw = float(np.asarray(gate_rpys, float).reshape(-1, 3)[i, 2])
                 nrm = np.array([np.cos(yaw), np.sin(yaw), 0.0])
             else:
+                # Fall back to the direction from the previous point toward the next.
                 nxt = centers[i + 1] if i + 1 < len(centers) else c + (c - prev)
                 nrm = nxt - prev
             normals.append(nrm / (np.linalg.norm(nrm) + 1e-9))
@@ -679,7 +812,7 @@ class PointMassPlanner:
     def _extend(
         self, pts: list[np.ndarray], spd: list[float], cpts: np.ndarray, cspeeds: np.ndarray | None
     ) -> None:
-        """Append committed points and speeds to the path buffer."""
+        """Append committed points and speeds to the path buffer for smooth replanning."""
         pts.extend(cpts)
         if cspeeds is not None and len(cspeeds) == len(cpts):
             spd.extend(float(s) for s in cspeeds)
@@ -694,25 +827,29 @@ class PointMassPlanner:
         spd: list[float] = []
         has_prefix = self._committed_pts is not None and len(self._committed_pts) > 0
         if has_prefix:
+            # A committed prefix is laid down first so the new path starts where the drone is.
             self._extend(pts, spd, self._committed_pts, self._committed_speeds)
 
         if prims and not has_prefix:
             # Without a prefix the first primitive's t=0 sample seeds the polyline; with one it
-            # equals the last prefix point and is dropped below.
+            # equals the last prefix point and is dropped by the [1:] slice below.
             p0, v0 = prims[0].state_at(0.0)
             pts.append(p0)
             spd.append(float(np.linalg.norm(v0)))
         elif not prims and not has_prefix:
+            # Nothing to sample and no prefix -> a single origin point (degenerate guard).
             pts.append(np.zeros(3))
             spd.append(0.0)
         for prim in prims or []:
-            for t in np.linspace(0.0, prim.T, max(self._n_path_samples, 2))[1:]:
+            # Discretize each primitive (skip its t=0 sample; it duplicates the previous endpoint).
+            for t in np.linspace(0.0, prim.Ttotal, max(self._n_path_samples, 2))[1:]:
                 p, v = prim.state_at(t)
                 pts.append(p)
                 spd.append(float(np.linalg.norm(v)))
 
         has_suffix = self._committed_suffix_pts is not None and len(self._committed_suffix_pts) > 0
         if has_suffix:
+            # On a local-horizon replan, append the fixed backbone suffix.
             self._extend(pts, spd, self._committed_suffix_pts, self._committed_suffix_speeds)
 
         dense = np.array(pts, dtype=np.float64)
@@ -728,14 +865,19 @@ class PointMassPlanner:
             dense = np.vstack([dense, dense[-1] + self._tail * tang])
             speed_dense = np.append(speed_dense, speed_dense[-1])
 
-        dense[:, 2] = np.maximum(dense[:, 2], self._min_z)  # ground clearance
+        # Ground clearance.
+        dense[:, 2] = np.maximum(dense[:, 2], self._min_z)
 
-        # True arc-length parameterization: cumulative chord length, drop zero-length segments,
-        # then resample position and speed uniformly in arc length.
+        # True arc-length parameterization (MPCC paper Sec. C, eq. (8)): cumulative chord length,
+        # drop zero-length segments, then resample position and speed uniformly in arc length.
+        # Chord length of each segment between consecutive sampled points.
         seg = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+        # Keep the first point and drop duplicates so the arc length strictly increases.
         keep = np.concatenate(([True], seg > 1e-6))
         dense, speed_dense = dense[keep], speed_dense[keep]
+        # Recompute segment lengths after dropping duplicates.
         seg = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+        # Cumulative arc length along the path (the stored arc length per point).
         cum = np.concatenate(([0.0], np.cumsum(seg)))
         total = float(cum[-1])
         if total < 1e-6:  # degenerate path -> tiny straight stub to keep the spline valid
@@ -744,19 +886,23 @@ class PointMassPlanner:
             cum = np.array([0.0, 1e-3])
             total = 1e-3
 
+        # Equidistant arc-length grid to resample onto.
         s_uniform = np.linspace(0.0, total, self._n_eval_points)
+        # Resample position at each arc-length sample (linear interp between stored points).
         pos_uniform = np.stack([np.interp(s_uniform, cum, dense[:, k]) for k in range(3)], axis=1)
-        # Clip exported speed to v_max (diagonal motions can nudge the norm above the per-axis cap).
+        # Resample speed the same way, clipped to v_max (diagonal motion can nudge the norm up).
         speed_uniform = np.clip(np.interp(s_uniform, cum, speed_dense), 0.0, self._v_max)
 
+        # Store the arc-length knots and total length.
         self._s = s_uniform
         self._s_total = total
+        # Fit the cubic spline p(s) the MPCC evaluates, plus its derivative dp/ds (unit tangent).
         self._des_pos_spline = CubicSpline(s_uniform, pos_uniform)
         self._des_vel_spline = self._des_pos_spline.derivative()
         self._waypoints_pos = pos_uniform
         self._speed_profile = speed_uniform
 
-    # -- public API consumed by attitude_mpc.py -------------------------------------------
+    # -- public API consumed by attitude_mpc.py for MPCC and logging ----------------------
     @property
     def total_length(self) -> float:
         """Return the total arc length of the planned trajectory."""
@@ -835,7 +981,12 @@ class PointMassPlanner:
 
 
 class AsyncPMMReplanner:
-    """Run PMM replans on a background thread without blocking the control loop."""
+    """Run a PMM replan on a background thread so the 50 Hz control loop never stalls.
+
+    A full replan is too long to run inside a single control tick. Instead of blocking, ``request``
+    launches the planner build on a daemon thread while the control loop keeps flying the current
+    path; each tick it calls ``take`` to swap in the finished planner once it is ready.
+    """
 
     def __init__(self) -> None:
         """Initialize the replanner."""
