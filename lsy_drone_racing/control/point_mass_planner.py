@@ -317,7 +317,7 @@ class _GraphPlanner:
         collision_margin: float = 0.05,
         gate_exit_dist: float = 0.3,
         turn_penalty_weight: float = 0.3,
-        max_retries: int = 6,
+        max_turn_angle: float = np.pi,
     ) -> None:
         """Initialize the graph planner and sample the gate-crossing layers.
 
@@ -329,8 +329,8 @@ class _GraphPlanner:
         seed: Random seed for reproducible gate-state sampling; collision_margin: Safety margin
         added around obstacles during collision checking; gate_exit_dist: Distance beyond each
         gate for generating exit-state layers; turn_penalty_weight: Weight of the turn-angle
-        penalty in edge costs; max_retries: Maximum number of colliding edges banned and
-        re-solved before giving up and letting the caller fall back.
+        penalty in edge costs; max_turn_angle: Hard cap on the per-edge turn angle; edges whose
+        entry or exit bend exceeds it are rejected outright (default pi = no rejection).
         """
         self.u_max = u_max
         self.velocity_limits = np.full(3, float(v_max))
@@ -338,7 +338,7 @@ class _GraphPlanner:
         self.n_collision_pts = n_collision_pts
         self.collision_margin = float(collision_margin)
         self.turn_penalty_weight = float(turn_penalty_weight)
-        self.max_retries = int(max_retries)
+        self.max_turn_angle = float(max_turn_angle)
         self.stats: dict[str, float] = {"cost": np.inf}
         rng = np.random.default_rng(seed)
 
@@ -435,6 +435,8 @@ class _GraphPlanner:
             ang_out = np.arccos(np.clip(np.einsum("bd,abd->ab", uB, path_direction), -1.0, 1.0))
             # Increase the cost of sharp-turn edges, weighted by turn_penalty_weight.
             cost = cost + self.turn_penalty_weight * (ang_in**2 + ang_out**2)
+            # Reject edges whose entry or exit bend exceeds max_turn_angle (default pi = no-op).
+            cost[np.maximum(ang_in, ang_out) > self.max_turn_angle] = np.inf
 
             # Build the final graph adjacency list, skipping edges that are infeasible
             for a_idx in range(len(layer_A)):
@@ -488,62 +490,38 @@ class _GraphPlanner:
         return path_nodes, float(best_cost[end_node])
 
     def solve(self) -> list[MotionPrimitive] | None:
-        """Return the minimum-time collision-free primitive chain, or None if infeasible.
+        """Return the minimum-time primitive chain through the gates, or None if infeasible.
 
-        Find the fastest route, collision-check only its primitives, and if one clips an
-        obstacle, ban that single edge and re-solve.
+        Find the single fastest route through the graph, then collision-check only the primitives
+        on that optimal route. If any of them clips an obstacle, return None so the caller drops to
+        the no-check straight-line fallback. The optimal path is used as-is and never patched
+        around obstacles by banning edges and re-solving; this matches the working smooth-replan
+        behaviour and avoids the contorted detour routes that the MPCC cannot track.
         """
         t0 = time.perf_counter()
         nodes, adj, end_node = self._build_graph()
 
-        banned: set[tuple[int, int]] = set()
-        for attempt in range(self.max_retries + 1):
-            path_nodes, cost = self._dijkstra(adj, end_node, banned)
-            if path_nodes is None:
-                # No route left once colliding edges are banned -> caller falls back.
+        path_nodes, cost = self._dijkstra(adj, end_node, banned=set())
+        if path_nodes is None:
+            self.stats = {"cost": np.inf}
+            logger.debug("graph: infeasible, %.1f ms", 1e3 * (time.perf_counter() - t0))
+            return None
+
+        # Reconstruct the best route and collision-check only its primitives.
+        prims: list[MotionPrimitive] = []
+        for i in range(len(path_nodes) - 1):
+            a, b = nodes[path_nodes[i]], nodes[path_nodes[i + 1]]
+            prim = MotionPrimitive(
+                a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.velocity_limits
+            )
+            if not self._edge_ok(prim):
                 self.stats = {"cost": np.inf}
-                logger.debug(
-                    "graph: infeasible after %d attempt(s), %d edge(s) banned, %.1f ms",
-                    attempt + 1,
-                    len(banned),
-                    1e3 * (time.perf_counter() - t0),
-                )
-                return None
+                return None  # optimal path clips an obstacle -> trigger fallback
+            prims.append(prim)
 
-            # Build the primitives along the route, checking collisions; ban the first bad edge.
-            prims: list[MotionPrimitive] = []
-            bad_edge: tuple[int, int] | None = None
-            for i in range(len(path_nodes) - 1):
-                a, b = nodes[path_nodes[i]], nodes[path_nodes[i + 1]]
-                prim = MotionPrimitive(
-                    a["pos"], a["vel"], b["pos"], b["vel"], self.u_max, self.velocity_limits
-                )
-                if not self._edge_ok(prim):
-                    bad_edge = (path_nodes[i], path_nodes[i + 1])
-                    break
-                prims.append(prim)
-
-            if bad_edge is None:
-                self.stats = {"cost": cost}
-                logger.debug(
-                    "graph: solved in %d attempt(s), cost=%.3f s, %d edge(s) banned, %.1f ms",
-                    attempt + 1,
-                    cost,
-                    len(banned),
-                    1e3 * (time.perf_counter() - t0),
-                )
-                return prims
-
-            banned.add(bad_edge)  # disable the clipping edge and re-solve
-
-        # No collision-free route within max_retries -> let the caller use the no-check fallback.
-        self.stats = {"cost": np.inf}
-        logger.debug(
-            "graph: %d colliding retries exhausted -> fallback, %.1f ms",
-            self.max_retries,
-            1e3 * (time.perf_counter() - t0),
-        )
-        return None
+        self.stats = {"cost": cost}
+        logger.debug("graph: solved, cost=%.3f s, %.1f ms", cost, 1e3 * (time.perf_counter() - t0))
+        return prims
 
 
 class PointMassPlanner:
@@ -570,7 +548,7 @@ class PointMassPlanner:
         seed: int = 0,
         gate_exit_dist: float = 0.3,
         turn_penalty_weight: float = 0.3,
-        max_retries: int = 6,
+        max_turn_angle: float = np.pi,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
         committed_suffix_pts: np.ndarray | None = None,
@@ -587,7 +565,8 @@ class PointMassPlanner:
         seed: random seed for reproducible graph sampling;
         gate_exit_dist: offset behind each gate forcing a straight crossing so the gate counts;
         turn_penalty_weight: cost weight for angular deviation in graph edges;
-        max_retries: number of colliding edges banned and re-solved before the no-check fallback;
+        max_turn_angle: hard cap on the turn angle at either end of an edge; edges bending more
+        than this are rejected outright (default pi = no rejection, only the soft turn penalty);
         committed_pts: previously executed trajectory points for replanning continuity;
         committed_speeds: speeds corresponding to committed trajectory points;
         committed_suffix_pts: fixed trajectory suffix appended after optimized segment;
@@ -609,7 +588,7 @@ class PointMassPlanner:
         self._seed = int(seed)
         self._gate_exit_dist = float(gate_exit_dist)
         self._turn_penalty_weight = float(turn_penalty_weight)
-        self._max_retries = int(max_retries)
+        self._max_turn_angle = float(max_turn_angle)
 
         # Take snapshot of the parameters
         self._kwargs = dict(
@@ -627,7 +606,7 @@ class PointMassPlanner:
             seed=self._seed,
             gate_exit_dist=self._gate_exit_dist,
             turn_penalty_weight=self._turn_penalty_weight,
-            max_retries=self._max_retries,
+            max_turn_angle=self._max_turn_angle,
         )
 
         self.plan(
@@ -760,7 +739,7 @@ class PointMassPlanner:
             collision_margin=self._collision_margin,
             gate_exit_dist=self._gate_exit_dist,
             turn_penalty_weight=self._turn_penalty_weight,
-            max_retries=self._max_retries,
+            max_turn_angle=self._max_turn_angle,
         )
         prims = gp.solve()
         return prims, gp.stats
