@@ -16,6 +16,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline, CubicSpline
 
@@ -164,55 +166,81 @@ def _fixed_time_1d(
     return _CubicAxis1D(p0, v0, pf, vf, T_target)
 
 
-def _edge_cost_matrix(
-    pA: np.ndarray,
-    vA: np.ndarray,
-    pB: np.ndarray,
-    vB: np.ndarray,
-    u_max: np.ndarray,
-    v_cap: np.ndarray,
-) -> np.ndarray:
-    """Minimum edge time T* between every layer-A and layer-B state; a (KA, KB) matrix.
+def _jax_edge_cost_base(
+    p0: jax.Array, v0: jax.Array, pf: jax.Array, vf: jax.Array, u_max: jax.Array, v_cap: jax.Array
+) -> jax.Array:
+    """Compute the minimum-time edge cost for a single primitive."""
+    dp = pf - p0
 
-    Vectorized twin of ``min_time_1d`` (identical bang-bang / bang-singular-bang formulas), applied
-    to all KA*KB edges and 3 axes at once because the graph scores ~10^5 candidate edges per plan.
-    """
-    dp = (pB[None, :, :] - pA[:, None, :])[..., None]  # (KA, KB, 3, 1)
-    v0 = vA[:, None, :, None]
-    vf = vB[None, :, :, None]
-    u = u_max[:, None]
-    vc = v_cap[:, None]
-    # 4 candidates per axis = 2 accel orderings x 2 quadratic roots (min_time_1d's two orderings).
-    a1 = u * np.array([1.0, 1.0, -1.0, -1.0])
-    a2 = u * np.array([-1.0, -1.0, 1.0, 1.0])
-    root = np.array([1.0, -1.0, 1.0, -1.0])
-    A = a1 * (a2 - a1) / (2.0 * a2)
-    B = v0 * (a2 - a1) / a2
-    C = (vf**2 - v0**2) / (2.0 * a2) - dp
-    disc = B**2 - 4.0 * A * C
-    t1 = (-B + root * np.sqrt(np.maximum(disc, 0.0))) / (2.0 * A)
-    t2 = (vf - v0 - a1 * t1) / a2
-    valid = (disc >= 0.0) & (t1 >= -1e-4) & (t2 >= -1e-4)
-    t1 = np.maximum(t1, 0.0)
-    T_bb = np.where(valid, t1 + np.maximum(t2, 0.0), np.inf)
+    def _solve_axis(
+        dp_ax: jax.Array,
+        v0_ax: jax.Array,
+        vf_ax: jax.Array,
+        u_max_ax: jax.Array,
+        v_cap_ax: jax.Array,
+    ) -> jax.Array:
+        # Two bang-bang sequences: (+u, -u) and (-u, +u). dp = A t1^2 + B t1 + C per sequence.
+        a1_seq = jnp.array([u_max_ax, -u_max_ax])
+        a2_seq = jnp.array([-u_max_ax, u_max_ax])
+        A = a1_seq * (a2_seq - a1_seq) / (2.0 * a2_seq)
+        B = v0_ax * (a2_seq - a1_seq) / a2_seq
+        C = (vf_ax**2 - v0_ax**2) / (2.0 * a2_seq) - dp_ax
 
-    # Bang-singular-bang time for the candidates whose peak speed exceeds the cap.
-    v_peak = v0 + a1 * t1
-    v_sat = np.sign(v_peak) * vc
-    a_acc = np.where(v_sat >= v0, u, -u)
-    a_dec = np.where(vf >= v_sat, u, -u)
-    t1c = (v_sat - v0) / a_acc
-    t3c = (vf - v_sat) / a_dec
-    d1 = (v_sat**2 - v0**2) / (2.0 * a_acc)
-    d3 = (vf**2 - v_sat**2) / (2.0 * a_dec)
-    t2c = (dp - d1 - d3) / np.where(np.abs(v_sat) < 1e-6, 1e-6, v_sat)
-    valid_cap = (t1c >= -1e-4) & (t2c >= -1e-4) & (t3c >= -1e-4)
-    T_cap = np.where(
-        valid_cap, np.maximum(t1c, 0.0) + np.maximum(t2c, 0.0) + np.maximum(t3c, 0.0), np.inf
+        disc = B**2 - 4.0 * A * C
+        valid_disc = disc >= 0.0
+        sq = jnp.sqrt(jnp.maximum(disc, 0.0))
+
+        # 4 candidate roots for t1 (2 sequences x 2 quadratic roots).
+        t1_cands = jnp.array(
+            [
+                (-B[0] + sq[0]) / (2.0 * A[0]),
+                (-B[0] - sq[0]) / (2.0 * A[0]),
+                (-B[1] + sq[1]) / (2.0 * A[1]),
+                (-B[1] - sq[1]) / (2.0 * A[1]),
+            ]
+        )
+        valid_disc_cands = jnp.array([valid_disc[0], valid_disc[0], valid_disc[1], valid_disc[1]])
+        a1_cands = jnp.array([a1_seq[0], a1_seq[0], a1_seq[1], a1_seq[1]])
+        a2_cands = jnp.array([a2_seq[0], a2_seq[0], a2_seq[1], a2_seq[1]])
+
+        t2_cands = (vf_ax - v0_ax - a1_cands * t1_cands) / a2_cands
+        valid_bb = valid_disc_cands & (t1_cands >= -1e-4) & (t2_cands >= -1e-4)
+        t1_cands = jnp.maximum(t1_cands, 0.0)
+        t2_cands = jnp.maximum(t2_cands, 0.0)
+        T_bb = jnp.where(valid_bb, t1_cands + t2_cands, jnp.inf)
+
+        # Bang-singular-bang: insert a velocity-capped cruise when the peak exceeds v_cap (eq. 24).
+        v_peak = v0_ax + a1_cands * t1_cands
+        needs_cap = valid_bb & (jnp.abs(v_peak) > v_cap_ax)
+        v_sat = jnp.sign(v_peak) * v_cap_ax
+        v_sat_safe = jnp.where(jnp.abs(v_sat) < 1e-6, 1e-6, v_sat)
+        a_acc = jnp.where(v_sat >= v0_ax, u_max_ax, -u_max_ax)
+        a_dec = jnp.where(vf_ax >= v_sat, u_max_ax, -u_max_ax)
+        t1_c = (v_sat - v0_ax) / a_acc
+        t3_c = (vf_ax - v_sat) / a_dec
+        d1 = (v_sat**2 - v0_ax**2) / (2.0 * a_acc)
+        d3 = (vf_ax**2 - v_sat**2) / (2.0 * a_dec)
+        t2_c = (dp_ax - d1 - d3) / v_sat_safe
+        valid_cap = (t1_c >= -1e-4) & (t2_c >= -1e-4) & (t3_c >= -1e-4)
+        T_cap = jnp.where(
+            valid_cap,
+            jnp.maximum(t1_c, 0.0) + jnp.maximum(t2_c, 0.0) + jnp.maximum(t3_c, 0.0),
+            jnp.inf,
+        )
+
+        return jnp.min(jnp.where(needs_cap, T_cap, T_bb))
+
+    return jnp.max(jax.vmap(_solve_axis)(dp, v0, vf, u_max, v_cap))
+
+
+# JIT-compiled and double-vmapped over layer-A (axis 0) x layer-B (axis 0): scores every
+# candidate edge (~10^5 per plan) in one batched call. u_max/v_cap are held per-axis (3,).
+_jax_edge_cost = jax.jit(
+    jax.vmap(
+        jax.vmap(_jax_edge_cost_base, in_axes=(None, None, 0, 0, None, None)),
+        in_axes=(0, 0, None, None, None, None),
     )
-    needs_cap = valid & (np.abs(v_peak) > vc)
-    # Per axis: min over the 4 candidates; then the edge time is the slowest of the 3 axes.
-    return np.where(needs_cap, T_cap, T_bb).min(axis=3).max(axis=2)
+)
 
 
 class MotionPrimitive:
@@ -414,14 +442,17 @@ class _GraphPlanner:
             velocities_A = np.asarray([state["vel"] for state in layer_A], dtype=np.float64)
             positions_B = np.asarray([state["pos"] for state in layer_B], dtype=np.float64)
             velocities_B = np.asarray([state["vel"] for state in layer_B], dtype=np.float64)
-            # Compute all edge costs
-            cost = _edge_cost_matrix(
-                positions_A,
-                velocities_A,
-                positions_B,
-                velocities_B,
-                self.u_max,
-                self.velocity_limits,
+            # Compute all edge costs in one batched, JIT-compiled jax call (GPU/CPU), then
+            # transfer the (KA, KB) matrix back to numpy once.
+            cost = np.array(
+                _jax_edge_cost(
+                    jnp.array(positions_A),
+                    jnp.array(velocities_A),
+                    jnp.array(positions_B),
+                    jnp.array(velocities_B),
+                    jnp.array(self.u_max),
+                    jnp.array(self.velocity_limits),
+                )
             )
 
             # Penalize edges that require large changes in flight direction.
@@ -549,6 +580,7 @@ class PointMassPlanner:
         gate_exit_dist: float = 0.3,
         turn_penalty_weight: float = 0.3,
         max_turn_angle: float = np.pi,
+        check_obstacles: bool = True,
         committed_pts: np.ndarray | None = None,
         committed_speeds: np.ndarray | None = None,
         committed_suffix_pts: np.ndarray | None = None,
@@ -567,6 +599,9 @@ class PointMassPlanner:
         turn_penalty_weight: cost weight for angular deviation in graph edges;
         max_turn_angle: hard cap on the turn angle at either end of an edge; edges bending more
         than this are rejected outright (default pi = no rejection, only the soft turn penalty);
+        check_obstacles: prune graph edges against obstacles. Set False for the offline plan, whose
+        gate/obstacle positions are only nominal (unrevealed), so a collision check is meaningless
+        and would force the crude single-sample fallback; replans (revealed positions) keep it True;
         committed_pts: previously executed trajectory points for replanning continuity;
         committed_speeds: speeds corresponding to committed trajectory points;
         committed_suffix_pts: fixed trajectory suffix appended after optimized segment;
@@ -589,6 +624,9 @@ class PointMassPlanner:
         self._gate_exit_dist = float(gate_exit_dist)
         self._turn_penalty_weight = float(turn_penalty_weight)
         self._max_turn_angle = float(max_turn_angle)
+        # Deliberately kept out of self._kwargs below: replans spawned from these kwargs must
+        # default back to check_obstacles=True (revealed positions), regardless of this plan.
+        self._check_obstacles = bool(check_obstacles)
 
         # Take snapshot of the parameters
         self._kwargs = dict(
@@ -668,16 +706,16 @@ class PointMassPlanner:
         t0 = time.perf_counter()
         logger.info("plan START: gates=%d, M=%d", len(centers), self._n_vel_samples)
 
-        # Run the graph planner
+        # Run the graph planner. The offline plan disables obstacle pruning (nominal positions
+        # only), so it keeps the full-graph optimal route instead of dropping to the fallback.
         prims, stats = self._run_graph(
-            start_pos, start_vel, centers, normals, obstacle_filtering=True
+            start_pos, start_vel, centers, normals, obstacle_filtering=self._check_obstacles
         )
         use_fallback = prims is None
         if use_fallback:
             # Use fallback trajectory that may clip obstacles
             logger.warning(
-                "graph infeasible (no collision-free route) -> "
-                "single-sample no-check fallback (gates=%d)",
+                "graph infeasible (no route) -> single-sample no-check fallback (gates=%d)",
                 len(centers),
             )
             prims, stats = self._run_graph(

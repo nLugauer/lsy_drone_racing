@@ -271,7 +271,10 @@ class AttitudeMPC(Controller):
         if self.USE_PMM_PLANNER:
             v_max = 4.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
-            # Initialize the PMM planner
+            # Initialize the PMM planner. Skip obstacle checking on this offline plan: gate and
+            # obstacle positions are still nominal (unrevealed), so a collision check is
+            # meaningless here and would only force the crude single-sample fallback. Live replans
+            # re-enable it once the true positions are revealed.
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
@@ -282,6 +285,7 @@ class AttitudeMPC(Controller):
                 v_max=v_max,
                 n_vel_samples=600,
                 tail_extension=tail_extension,
+                check_obstacles=False,
             )
         else:
             self._trajectory = TrajectoryPlanner(
