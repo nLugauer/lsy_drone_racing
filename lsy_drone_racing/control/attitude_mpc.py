@@ -271,13 +271,16 @@ class AttitudeMPC(Controller):
         if self.USE_PMM_PLANNER:
             v_max = 4.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
-            # Initialize the PMM planner
+            # Offline backbone = the pure time-optimal line, obstacle-INDEPENDENT: obstacles are
+            # nominal at start and change on reveal, so avoiding them here is wasted work. Online
+            # replans (which pass their own obstacle snapshot) and the MPCC soft constraints own
+            # clearance. obstacle_manager=None -> a single Dijkstra pass, no collision fallback.
             self._trajectory = PointMassPlanner(
                 start_pos=start_pos,
                 gates_pos=gate_positions,
                 gate_rpys=gate_rpys,
                 start_vel=np.array(obs["vel"], dtype=np.float64),
-                obstacle_manager=self._obstacle_manager.snapshot(),
+                obstacle_manager=None,
                 u_max=12.0,
                 v_max=v_max,
                 n_vel_samples=600,
