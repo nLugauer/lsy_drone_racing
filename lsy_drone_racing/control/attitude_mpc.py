@@ -265,14 +265,17 @@ class AttitudeMPC(Controller):
                 lower_frame_radius=lower_r,
             )
 
-        self._gates_visited_flags = np.zeros(len(gate_positions), dtype=bool)
         start_pos = np.array(obs["pos"], dtype=np.float64)
 
         if self.USE_PMM_PLANNER:
             # PMM racing line (Foehn et al. 2021, Sec. VI), refit as an arc-length cubic spline.
             # v_max matches the MPCC v_theta cap; the tail past the last gate must cover the MPCC
-            # look-ahead so the reference does not pile up at the spline end. The snapshot gives the
-            # planner a frozen, thread-safe obstacle copy.
+            # look-ahead so the reference does not pile up at the spline end.
+            # Offline backbone is obstacle-INDEPENDENT (obstacle_manager=None): obstacles are nominal
+            # at start and shift on reveal, so pre-avoiding them here is wasted and only risks
+            # rejecting the optimal line (which already threads the gate centers) into the crude
+            # single-sample fallback. Online replans stay obstacle-aware and the MPCC soft
+            # constraints own final clearance.
             v_max = 4.0
             tail_extension = max(0.5, v_max * self._T_HORIZON + 0.5)
             self._trajectory = PointMassPlanner(
@@ -280,7 +283,7 @@ class AttitudeMPC(Controller):
                 gates_pos=gate_positions,
                 gate_rpys=gate_rpys,
                 start_vel=np.array(obs["vel"], dtype=np.float64),
-                obstacle_manager=self._obstacle_manager.snapshot(),
+                obstacle_manager=None,
                 u_max=12.0,
                 v_max=v_max,
                 n_vel_samples=600,  # offline initial plan: more samples -> better global line
@@ -374,14 +377,10 @@ class AttitudeMPC(Controller):
         obstacles_pos = np.array(obs.get("obstacles_pos", np.empty((0, 3))), dtype=np.float64)
         self._obstacle_manager.update_pole_positions(obstacles_pos)
 
-        # Replan when a gate's observed position changes
-        if gates_pos is not None and self.PMM_REPLAN:
-            if self.USE_PMM_PLANNER:
-                self._maybe_replan_pmm(
-                    obs, gates_pos, gates_rpys if gates_yaw is not None else None
-                )
-            elif "gates_visited" in obs:
-                self._original_rebuild(obs, gates_pos)
+        # Replan when a gate's observed position changes (PMM planner only; the legacy
+        # TrajectoryPlanner baseline plans once and does not replan on gate reveal).
+        if gates_pos is not None and self.PMM_REPLAN and self.USE_PMM_PLANNER:
+            self._maybe_replan_pmm(obs, gates_pos, gates_rpys if gates_yaw is not None else None)
 
         # The environment sets target_gate to -1 once the final gate plane is crossed.
         target_gate_idx = int(obs.get("target_gate", 0))
@@ -644,28 +643,6 @@ class AttitudeMPC(Controller):
             xj = self._acados_ocp_solver.get(j, "x")
             xj[13] += delta
             self._acados_ocp_solver.set(j, "x", xj)
-
-    def _original_rebuild(
-        self, obs: dict[str, NDArray[np.floating]], gates_pos: NDArray[np.floating]
-    ) -> None:
-        """Synchronous rebuild for the non-PMM spline planner (USE_PMM_PLANNER False).
-
-        Rebuilds the reference through the revealed gate centers the first time any gate enters
-        sensor range, then re-anchors the progress state.
-        """
-        gates_visited_now = np.array(obs["gates_visited"], dtype=bool)
-        if not np.any(gates_visited_now & ~self._gates_visited_flags):
-            return
-        # Only gates from the current target onwards, to avoid routing back through a passed gate.
-        target_gate_idx = int(obs.get("target_gate", 0))
-        if 0 <= target_gate_idx < len(gates_pos):
-            remaining_gates = gates_pos[target_gate_idx:]
-        else:
-            remaining_gates = gates_pos[-1:]
-        self._trajectory.rebuild(obs["pos"], remaining_gates, gate_rpys=None)
-        self._reanchor_progress(obs)
-        self._gates_visited_flags = gates_visited_now.copy()
-        self._needs_warm_start_reset = True
 
     def render_callback(self, sim: Sim):
         """Draw the reference path, current MPCC target, predicted horizon, and obstacles."""

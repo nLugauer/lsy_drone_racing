@@ -113,29 +113,6 @@ class TrajectoryPlanner:
 
         return np.array(pts, dtype=np.float64)
 
-    def rebuild(
-        self, start_pos: np.ndarray, gates_pos: np.ndarray, gate_rpys: np.ndarray | None = None
-    ) -> None:
-        """Rebuild the spline in-place with updated gate positions.
-
-        Call this when a gate's true position becomes known. The trajectory object
-        is updated and all subsequent evaluate() / get_polynomial_coeffs_at() calls
-        will use the new spline. Theta values from the previous spline are invalid
-        after this call — use nearest_theta() to re-initialize.
-
-        Args:
-            start_pos: Current drone position used as spline anchor.
-            gates_pos: (N, 3) updated gate positions (mix of nominal and true).
-            gate_rpys: (N, 3) gate orientations. Pass None to skip approach waypoints.
-        """
-        waypoints = self._build_waypoints(start_pos, gates_pos, gate_rpys)
-        self._s, self._des_pos_spline = self._build_safe_spline(waypoints, self._min_z)
-        self._s_total = float(self._s[-1])
-        self._des_vel_spline = self._des_pos_spline.derivative()
-        self._waypoints_pos = self._des_pos_spline(
-            np.linspace(0, self._s_total, self._n_eval_points)
-        )
-
     def nearest_theta(self, pos: np.ndarray) -> float:
         """Return the arc-length parameter of the path point nearest to pos.
 
